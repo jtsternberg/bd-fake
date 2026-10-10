@@ -20,6 +20,40 @@ fake_root() { # <dir> [prefix]
     --prefix "${2:-arun}" >/dev/null) || { echo "fake_root: bd init failed in $1" >&2; exit 2; }
 }
 
+# A throwaway dolt sql-server owned by <pid>, for the contract test's real bd; prints its
+# port. On a port the kernel picked, never a fixed one: a machine's shared beads server
+# is on 3308. A watchdog stops it and removes its data when <pid> exits, however it
+# exits.
+dolt_start() { # <owner-pid>
+  local owner="$1" d port pid i
+  command -v dolt >/dev/null 2>&1 || { echo "dolt_start: dolt is required" >&2; return 1; }
+  d=$(mktemp -d "${TMPDIR:-/tmp}/bd-fake-dolt-XXXXXX") || return 1
+  port=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])') || return 1
+  [[ "$port" =~ ^[0-9]+$ && "$port" != 3308 ]] || { echo "dolt_start: bad port '$port'" >&2; return 1; }
+  mkdir -p "$d/data"
+  # Detached from every inherited fd: a server holding the caller's stdout open keeps
+  # a `$(…)` around the test waiting for as long as the server lives.
+  (cd "$d/data" && exec dolt sql-server --host 127.0.0.1 --port "$port") \
+    >"$d/server.log" 2>&1 </dev/null &
+  pid=$!
+  for ((i = 0; i < 300; i++)); do
+    nc -z 127.0.0.1 "$port" 2>/dev/null && break
+    kill -0 "$pid" 2>/dev/null || break
+    sleep 0.1
+  done
+  if ! nc -z 127.0.0.1 "$port" 2>/dev/null; then
+    cat "$d/server.log" >&2; kill "$pid" 2>&1; rm -rf "$d"
+    echo "dolt_start: dolt sql-server never listened on $port" >&2; return 1
+  fi
+  (
+    while kill -0 "$owner" 2>/dev/null; do sleep 1; done
+    kill "$pid"
+    for ((i = 0; i < 100; i++)); do kill -0 "$pid" 2>/dev/null || break; sleep 0.1; done
+    rm -rf "$d"
+  ) >>"$d/watchdog.log" 2>&1 </dev/null &
+  printf '%s\n' "$port"
+}
+
 PASS=0; FAIL=0; FAILED_CASES=()
 pass()  { PASS=$((PASS+1)); echo "  ✓ $1"; }
 fail()  { FAIL=$((FAIL+1)); FAILED_CASES+=("$1"); echo "  ✗ $1"; [[ -n "${2:-}" ]] && echo "    $2"; return 0; }
