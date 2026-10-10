@@ -75,13 +75,16 @@ is "one line per call" "2" "$(wc -l < "$T/calls.log" | tr -d ' ')"
 is "with the argv as given and the cwd" "$(jq -nc --arg c "$PWD" --arg r "$R" '[[$c, ["-C",$r,"show","--json",($r+"-none")]]]')" \
   "$(head -1 "$T/calls.log" | jq -c '[[.cwd, .argv]]')"
 is "argv words keep their spaces" '["list","--json","--label","a b"]' "$(sed -n 2p "$T/calls.log" | jq -c .argv)"
-BD_FAKE_LOG="$T/calls.log" BD_FAKE_REFUSAL_LOG="$T/u0.log" B frobnicate >/dev/null 2>&1
-is "an unsupported call is logged with its exit and why" "64 frobnicate" \
-  "$(tail -1 "$T/calls.log" | jq -r '"\(.exit) \(.argv[2])"')"
-BD_FAKE_LOG="$T/calls.log" BD_FAKE_REFUSAL_LOG="$T/u0.log" bd -C "$T/nostore" info >/dev/null 2>&1
-is "and so is a refused one" "97" "$(tail -1 "$T/calls.log" | jq -r .exit)"
-BD_FAKE_LOG="$T/calls.log" B info >/dev/null
-is "a call that ran has no exit field" "null" "$(tail -1 "$T/calls.log" | jq -r .exit)"
+is "each line carries the call's exit code" "1 0" "$(jq -rs '[.[].exit] | join(" ")' "$T/calls.log")"
+BD_FAKE_LOG="$T/c64.log" BD_FAKE_REFUSAL_LOG="$T/u0.log" B frobnicate >/dev/null 2>&1
+is "an unsupported call is one line" "1" "$(wc -l < "$T/c64.log" | tr -d ' ')"
+is "with its exit and why" "64 frobnicate unsupported: verb 'frobnicate'" \
+  "$(jq -r '"\(.exit) \(.argv[2]) \(.error)"' "$T/c64.log")"
+BD_FAKE_LOG="$T/c97.log" BD_FAKE_REFUSAL_LOG="$T/u0.log" bd -C "$T/nostore" info >/dev/null 2>&1
+is "and so is a refused one" "1 97" "$(wc -l < "$T/c97.log" | tr -d ' ') $(jq -r .exit "$T/c97.log")"
+BD_FAKE_LOG="$T/c0.log" B info >/dev/null
+is "a call that ran logs exit 0 and no error" "1 0 null" \
+  "$(wc -l < "$T/c0.log" | tr -d ' ') $(jq -r '"\(.exit) \(.error)"' "$T/c0.log")"
 
 echo "== unknown verbs and flags fail loudly"
 BD_FAKE_REFUSAL_LOG="$T/u.log" B frobnicate >/dev/null 2>"$T/err"; is "an unknown verb is exit 64" "64" "$?"

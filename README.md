@@ -39,7 +39,7 @@ Composer's `vendor/bin/bd-fake` is a shell proxy, so symlink `vendor/jtsternberg
 | Variable | Effect |
 |---|---|
 | `BD_FAKE_ALLOWED_ROOTS` | Colon-separated prefixes a root (`-C <dir>`, or the cwd) must resolve under. Default: `$TMPDIR`, `/tmp`, and on macOS the per-user temp dir `mktemp` falls back to. Anything else exits **97**, so a test can never write into a real checkout. |
-| `BD_FAKE_LOG` | When set, every call appends one JSON line: `{"cwd": ..., "argv": [...]}`, plus `"exit"` and `"error"` on a refused (97) or unsupported (64) call. Tests assert exact command shape with it. |
+| `BD_FAKE_LOG` | When set, each call appends exactly one JSON line as it exits: `{"cwd": ..., "argv": [...], "exit": N}`, plus `"error"` on a refused (97) or unsupported (64) call. Tests assert exact command shape with it. |
 | `BD_FAKE_REFUSAL_LOG` | When set, each refused or unsupported call appends one text line here. A harness that fails a test on a non-empty file catches the call even when the caller swallowed the exit code. |
 | `BD_AUDIT_ENABLED` | As in bd: `audit record` is refused without it. |
 | `BD_FAKE_REAL_BD` | For `--check-schema`: the real bd to read `bd schema` from, instead of the first `bd` on PATH that is not bd-fake. |

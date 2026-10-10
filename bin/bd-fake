@@ -11,9 +11,9 @@ Environment:
   BD_FAKE_ALLOWED_ROOTS  colon-separated prefixes a root must sit under (default:
                          $TMPDIR, /tmp, and on macOS the per-user temp dir). A root
                          outside them is refused with exit 97.
-  BD_FAKE_LOG            when set, every call's argv and cwd are appended to it as one
-                         JSON line; a refused (97) or unsupported (64) call carries
-                         "exit" and "error" too.
+  BD_FAKE_LOG            when set, each call appends one JSON line as it exits: its
+                         argv, cwd and exit code, and "error" on a refused (97) or
+                         unsupported (64) call.
   BD_FAKE_REFUSAL_LOG    when set, each refused or unsupported call is appended to it as
                          one text line, so a harness can fail a case on a non-empty file
                          even when the caller swallowed the exit code.
@@ -155,13 +155,16 @@ def parse(verb, args):
 
 
 # --- the fence and the logs -------------------------------------------------
-def log_call(extra=None):
+ERROR = None  # why a call was refused or unsupported, for its log line
+
+
+def log_call(rc):
     path = os.environ.get("BD_FAKE_LOG")
     if not path:
         return
-    rec = {"cwd": os.getcwd(), "argv": ARGV}
-    if extra:
-        rec.update(extra)
+    rec = {"cwd": os.getcwd(), "argv": ARGV, "exit": rc}
+    if ERROR:
+        rec["error"] = ERROR
     try:
         with open(path, "a") as f:
             f.write(json.dumps(rec, ensure_ascii=False) + "\n")
@@ -183,8 +186,9 @@ def log_refusal(line):
 
 def deny(msg):
     """A root this fake must not touch: exit 97, logged."""
+    global ERROR
     line = "bd-fake: refused (%s): bd %s\n" % (msg, " ".join(ARGV))
-    log_call({"exit": 97, "error": msg})
+    ERROR = msg
     if not log_refusal(line):
         sys.stderr.write(line)
     sys.stderr.write("bd-fake: refused: %s\n" % msg)
@@ -1134,7 +1138,6 @@ def check_schema():
 
 
 def main():
-    log_call()
     d, rest = split_global(ARGV)
     root = guarded_root(d)
     if not rest or rest[0] in ("help", "-h", "--help"):
@@ -1150,19 +1153,30 @@ def main():
     VERBS[verb](root, opts, pos)
 
 
-if __name__ == "__main__":
+def run():
+    global ERROR
     if ARGV[:1] == ["--check-schema"]:
-        sys.exit(check_schema())
+        return check_schema()
     try:
         main()
+        sys.stdout.flush()
+        return 0
     except Usage as e:
         msg = "bd-fake: unsupported (%s): bd %s\n" % (e, " ".join(ARGV))
         sys.stderr.write(msg)
-        log_call({"exit": 64, "error": "unsupported: %s" % e})
+        ERROR = "unsupported: %s" % e
         log_refusal(msg)
-        sys.exit(64)
+        return 64
     except Fail as e:
         sys.stderr.write("Error: %s\n" % e)
-        sys.exit(1)
+        return 1
     except BrokenPipeError:
-        sys.exit(141)
+        return 141
+    except SystemExit as e:
+        return e.code if isinstance(e.code, int) else 1
+
+
+if __name__ == "__main__":
+    rc = run()
+    log_call(rc)
+    sys.exit(rc)
