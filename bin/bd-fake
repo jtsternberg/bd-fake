@@ -961,6 +961,169 @@ VERBS = {
 }
 
 
+# --- --check-schema ----------------------------------------------------------
+# `bd schema` reflects the Go structs bd serializes, so validating the fake's records
+# against a real bd's schema catches a type, enum or field that drifted without a
+# dolt server. show/list/ready rows wrap the issue record in fields the schema's
+# issue type does not carry; those, and only those, are allowed on top of it.
+SHOW_EXTRA = {"parent", "dependent_count", "dependency_count", "comment_count",
+              "comments_omitted", "revision"}
+LIST_EXTRA = {"parent", "dependent_count", "dependency_count", "comment_count"}
+SCHEMA_KEYWORDS = {"$schema", "$id", "type", "enum", "format", "properties", "required",
+                   "additionalProperties", "items"}
+DATE_TIME = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})$")
+JSON_TYPES = {"string": (str,), "integer": (int,), "number": (int, float), "boolean": (bool,),
+              "object": (dict,), "array": (list,), "null": (type(None),)}
+
+
+def validate(v, sch, path, errs, extra=()):
+    if sch is True:
+        return
+    if sch is False:
+        errs.append("%s: the schema allows nothing here" % path)
+        return
+    if "type" in sch:
+        types = sch["type"] if isinstance(sch["type"], list) else [sch["type"]]
+        ok = any(isinstance(v, JSON_TYPES.get(t, ())) and not (t in ("integer", "number") and isinstance(v, bool))
+                 for t in types)
+        if not ok:
+            errs.append("%s: wanted %s, got %s" % (path, "|".join(types), json.dumps(v)[:60]))
+            return
+    if "enum" in sch and v not in sch["enum"]:
+        errs.append("%s: %s not in %s" % (path, json.dumps(v), json.dumps(sch["enum"])))
+    if sch.get("format") == "date-time" and isinstance(v, str) and not DATE_TIME.match(v):
+        errs.append("%s: %s is not a date-time" % (path, json.dumps(v)))
+    if isinstance(v, dict):
+        props = sch.get("properties", {})
+        for k in sch.get("required", []):
+            if k not in v:
+                errs.append("%s.%s: required, and missing" % (path, k))
+        for k, x in v.items():
+            if k in props:
+                validate(x, props[k], "%s.%s" % (path, k), errs)
+            elif k in extra:
+                continue
+            elif sch.get("additionalProperties", True) is False:
+                errs.append("%s.%s: not in the schema" % (path, k))
+            elif isinstance(sch.get("additionalProperties"), dict):
+                validate(x, sch["additionalProperties"], "%s.%s" % (path, k), errs)
+    if isinstance(v, list) and "items" in sch:
+        for n, x in enumerate(v):
+            validate(x, sch["items"], "%s[%d]" % (path, n), errs)
+
+
+def unknown_keywords(sch, path, errs):
+    """Every keyword anywhere in the schema, used by a sample record or not: one this
+    check skips would pass whatever it says."""
+    if not isinstance(sch, dict):
+        return
+    for k, x in sch.items():
+        if k not in SCHEMA_KEYWORDS:
+            errs.append("%s: schema keyword '%s' is one this check does not understand" % (path, k))
+    for k, x in sch.get("properties", {}).items():
+        unknown_keywords(x, "%s.%s" % (path, k), errs)
+    for k in ("items", "additionalProperties"):
+        unknown_keywords(sch.get(k), "%s.%s" % (path, k), errs)
+
+
+def find_real_bd():
+    named = os.environ.get("BD_FAKE_REAL_BD")
+    if named:
+        return named
+    me = os.path.realpath(__file__)
+    for d in os.environ.get("PATH", "").split(os.pathsep):
+        c = os.path.join(d, "bd")
+        if not d or not os.path.isfile(c) or not os.access(c, os.X_OK):
+            continue
+        if os.path.realpath(c) == me:
+            continue
+        try:
+            with open(c, "rb") as f:
+                if b"bd-fake" in f.read(4096):
+                    continue  # a harness shim that execs this fake
+        except OSError:
+            continue
+        return c
+    return None
+
+
+def sample_records():
+    """One of each record kind the fake prints, from a throwaway root."""
+    import subprocess
+    import tempfile
+    top = tempfile.mkdtemp(prefix="bd-fake-schema-")
+    root = os.path.join(top, "r")
+    os.mkdir(root)
+    env = {k: v for k, v in os.environ.items() if not k.startswith("BD_FAKE_")}
+    env.update(BD_FAKE_ALLOWED_ROOTS=top, BD_AUDIT_ENABLED="1")
+
+    def bd(*a):
+        return subprocess.run([sys.executable, "-I", "-S", os.path.realpath(__file__), "-C", root] + list(a),
+                              env=env, cwd=root, check=True, capture_output=True, text=True).stdout.strip()
+    try:
+        bd("init", "--prefix", "s", "--quiet")
+        e = bd("create", "--silent", "--type", "epic", "--priority", "1", "--title", "epic",
+               "--description", "d", "--labels", "a,b", "--metadata", '{"k":"v","n":1}')
+        t1 = bd("create", "--silent", "--parent", e, "--title", "one")
+        t2 = bd("create", "--silent", "--parent", e, "--title", "two", "--deps", t1)
+        bd("update", t2, "--append-notes", "note", "--set-metadata", "x=1")
+        bd("comments", "add", t2, "a comment")
+        bd("gate", "create", "--type=gh:pr", "--blocks", t2, "--await-id", "7")
+        t3 = bd("create", "--silent", "--parent", e, "--title", "three", "--status", "in_progress")
+        bd("update", t3, "--status", "blocked")
+        bd("close", t1, "--reason", "done")
+        out = []
+        for row in json.loads(bd("show", e, t1, t2, t3, "--json")):
+            deps = row.pop("dependencies", [])
+            out.append(("show", row, SHOW_EXTRA))
+            out.extend(("show dependency", d, SHOW_EXTRA | {"dependency_type"}) for d in deps)
+        out.extend(("list", r, LIST_EXTRA) for r in json.loads(bd("list", "--all", "--json")))
+        out.extend(("ready", r, LIST_EXTRA) for r in json.loads(bd("ready", "--json")))
+        out.extend(("gate list", r, ()) for r in json.loads(bd("gate", "list", "--json")) or [])
+        out.extend(("comment", c, None) for c in json.loads(bd("comments", t2, "--json")))
+        return out
+    finally:
+        import shutil
+        shutil.rmtree(top, ignore_errors=True)
+
+
+def check_schema():
+    import subprocess
+    tag = "bd-fake --check-schema"
+    real = find_real_bd()
+    if not real:
+        print("%s: skipped: no real bd on PATH (or name one with BD_FAKE_REAL_BD)" % tag)
+        return 0
+    env = {k: v for k, v in os.environ.items() if not k.startswith("BD_FAKE_")}
+    try:
+        p = subprocess.run([real, "schema"], env=env, capture_output=True, text=True, timeout=60)
+        schema = json.loads(p.stdout)
+        types = schema["types"]
+        issue, comment = types["issue"], types["issue"]["properties"]["comments"]["items"]
+    except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as e:
+        print("%s: FAILED: `%s schema` gave no schema with types.issue (%s)" % (tag, real, e))
+        return 1
+    try:
+        ver = subprocess.run([real, "version"], env=env, capture_output=True, text=True,
+                             timeout=60).stdout.strip().splitlines()[0]
+    except (OSError, IndexError, subprocess.SubprocessError):
+        ver = "(version unknown)"
+    errs = []
+    for name, sch in types.items():
+        unknown_keywords(sch, "schema.types." + name, errs)
+    recs = sample_records()
+    for n, (kind, rec, extra) in enumerate(recs):
+        validate(rec, comment if extra is None else issue, "%s#%d" % (kind, n), errs,
+                 () if extra is None else extra)
+    if errs:
+        print("%s: FAILED against %s at %s: %d problem(s)" % (tag, ver, real, len(errs)))
+        for e in dict.fromkeys(errs):
+            print("  " + e)
+        return 1
+    print("%s: ok against %s at %s (%d records)" % (tag, ver, real, len(recs)))
+    return 0
+
+
 def main():
     log_call()
     d, rest = split_global(ARGV)
@@ -979,6 +1142,8 @@ def main():
 
 
 if __name__ == "__main__":
+    if ARGV[:1] == ["--check-schema"]:
+        sys.exit(check_schema())
     try:
         main()
     except Usage as e:
