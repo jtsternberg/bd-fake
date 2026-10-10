@@ -1021,7 +1021,7 @@ def validate(v, sch, path, errs, extra=()):
                 errs.append("%s.%s: not in the schema" % (path, k))
             elif isinstance(sch.get("additionalProperties"), dict):
                 validate(x, sch["additionalProperties"], "%s.%s" % (path, k), errs)
-    if isinstance(v, list) and "items" in sch:
+    if isinstance(v, list) and isinstance(sch.get("items"), (dict, bool)):
         for n, x in enumerate(v):
             validate(x, sch["items"], "%s[%d]" % (path, n), errs)
 
@@ -1034,6 +1034,10 @@ def unknown_keywords(sch, path, errs):
     for k, x in sch.items():
         if k not in SCHEMA_KEYWORDS:
             errs.append("%s: schema keyword '%s' is one this check does not understand" % (path, k))
+    if "format" in sch and sch["format"] != "date-time":
+        errs.append("%s: format '%s' is one this check does not understand" % (path, sch["format"]))
+    if isinstance(sch.get("items"), list):
+        errs.append("%s.items: tuple-form items is one this check does not understand" % path)
     for k, x in sch.get("properties", {}).items():
         unknown_keywords(x, "%s.%s" % (path, k), errs)
     for k in ("items", "additionalProperties"):

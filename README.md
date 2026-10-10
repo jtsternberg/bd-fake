@@ -76,7 +76,7 @@ The store is `<root>/.bd-fake.json`, locked with `flock` on `<root>/.bd-fake.loc
 
 - **Contract test** (`tests/contract_test.sh`): one fixed script of calls, every verb and flag above, played against bd-fake and a real bd on a throwaway dolt server. Exit codes and JSON, with ids and timestamps normalized, must match.
 - **Version pin** (`tests/contract/BD_VERSION`): the bd the contract last passed against. Any other installed version fails the contract loudly, even when every step matches. After re-probing and fixing the fake, `BD_FAKE_ACCEPT_VERSION=1 bash tests/contract_test.sh` rewrites the pin, and only on a run where everything else is green.
-- **Schema check** (`bd-fake --check-schema`): validates the fake's show, list, ready, gate and comment records against a real bd's `bd schema`. With no real bd on PATH it prints a skip and exits 0.
+- **Schema check** (`bd-fake --check-schema`): validates the fake's show, list, ready, gate and comment records against a real bd's `bd schema`. A keyword it does not implement, a `format` other than `date-time`, or tuple-form `items` fails the check instead of passing unchecked. With no real bd on PATH it prints a skip and exits 0.
 
 ## Tests
 
