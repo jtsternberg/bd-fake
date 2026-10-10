@@ -1,0 +1,42 @@
+{
+  "name": "@jtsternberg/bd-fake",
+  "version": "0.1.0",
+  "description": "A drop-in fake bd (Beads CLI) for fast test suites, with a contract test that diffs it against the real bd.",
+  "bin": {
+    "bd-fake": "bin/bd-fake"
+  },
+  "files": [
+    "bin/bd-fake",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "test": "bash tests/run.sh"
+  },
+  "engines": {
+    "node": ">=16",
+    "python3": ">=3.7 (required at runtime; bin/bd-fake is a Python script)"
+  },
+  "os": [
+    "darwin",
+    "linux"
+  ],
+  "keywords": [
+    "beads",
+    "bd",
+    "fake",
+    "test-double",
+    "testing"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/jtsternberg/bd-fake.git"
+  },
+  "homepage": "https://github.com/jtsternberg/bd-fake#readme",
+  "bugs": "https://github.com/jtsternberg/bd-fake/issues",
+  "author": "Justin Sternberg <me@jtsternberg.com>",
+  "license": "MIT",
+  "publishConfig": {
+    "access": "public"
+  }
+}

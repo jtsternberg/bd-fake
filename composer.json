@@ -1,0 +1,23 @@
+{
+    "name": "jtsternberg/bd-fake",
+    "description": "A drop-in fake bd (Beads CLI) for fast test suites, with a contract test that diffs it against the real bd. Needs python3 at runtime.",
+    "type": "library",
+    "keywords": ["beads", "bd", "fake", "test-double", "testing"],
+    "homepage": "https://github.com/jtsternberg/bd-fake",
+    "license": "MIT",
+    "authors": [
+        {
+            "name": "Justin Sternberg",
+            "email": "me@jtsternberg.com"
+        }
+    ],
+    "support": {
+        "issues": "https://github.com/jtsternberg/bd-fake/issues",
+        "source": "https://github.com/jtsternberg/bd-fake"
+    },
+    "require": {},
+    "bin": ["bin/bd-fake"],
+    "archive": {
+        "exclude": ["/tests", "/.github", "/package.json"]
+    }
+}

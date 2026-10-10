@@ -1,0 +1,46 @@
+name: test
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      # The contract test needs a real bd and dolt. bd is the version
+      # tests/contract/BD_VERSION pins (any other one fails the contract on purpose),
+      # from its release tarball rather than brew, whose formula tracks the newest.
+      - name: Install the pinned bd and dolt
+        timeout-minutes: 3
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          BD_VERSION=$(tr -d '[:space:]' < tests/contract/BD_VERSION)
+          DOLT_VERSION=2.3.5
+          case "$(uname -s)-$(uname -m)" in
+            Linux-x86_64) os=linux arch=amd64 ;;
+            Darwin-arm64) os=darwin arch=arm64 ;;
+            Darwin-x86_64) os=darwin arch=amd64 ;;
+            *) echo "no release for $(uname -s)-$(uname -m)"; exit 1 ;;
+          esac
+          mkdir -p "$RUNNER_TEMP/tools"
+          curl -fsSL "https://github.com/gastownhall/beads/releases/download/v${BD_VERSION}/beads_${BD_VERSION}_${os}_${arch}.tar.gz" \
+            | tar xz -C "$RUNNER_TEMP/tools" ./bd
+          curl -fsSL "https://github.com/dolthub/dolt/releases/download/v${DOLT_VERSION}/dolt-${os}-${arch}.tar.gz" \
+            | tar xz -C "$RUNNER_TEMP/tools" --strip-components 2 "dolt-${os}-${arch}/bin/dolt"
+          git config --global user.name "bd-fake CI"
+          git config --global user.email "ci@example.invalid"
+          dolt config --global --add user.name "bd-fake CI" || true
+          dolt config --global --add user.email "ci@example.invalid" || true
+          echo "$RUNNER_TEMP/tools" >> "$GITHUB_PATH"
+          "$RUNNER_TEMP/tools/bd" --version
+          "$RUNNER_TEMP/tools/dolt" version
+      - name: Test
+        run: bash tests/run.sh
