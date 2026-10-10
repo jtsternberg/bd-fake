@@ -9,7 +9,8 @@ instead of passing.
 
 Environment:
   BD_FAKE_ALLOWED_ROOTS  colon-separated prefixes a root must sit under (default:
-                         $TMPDIR and /tmp). A root outside them is refused with exit 97.
+                         $TMPDIR, /tmp, and on macOS the per-user temp dir). A root
+                         outside them is refused with exit 97.
   BD_FAKE_LOG            when set, every call's argv and cwd are appended to it as one
                          JSON line; a refused (97) or unsupported (64) call carries
                          "exit" and "error" too.
@@ -193,7 +194,15 @@ def deny(msg):
 def allowed_roots():
     v = os.environ.get("BD_FAKE_ALLOWED_ROOTS")
     if v is None:
-        return [os.environ.get("TMPDIR") or "/tmp", "/tmp"]
+        roots = [os.environ.get("TMPDIR") or "/tmp", "/tmp"]
+        if sys.platform == "darwin":
+            # _CS_DARWIN_USER_TEMP_DIR, which Python has no name for: where mktemp
+            # puts a dir when TMPDIR is unset, as it is in a clean shell.
+            try:
+                roots.append(os.confstr(65537))
+            except (OSError, ValueError):
+                pass
+        return list(dict.fromkeys(r for r in roots if r))
     return [p for p in v.split(":") if p]
 
 

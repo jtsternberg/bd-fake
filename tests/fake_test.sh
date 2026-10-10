@@ -60,6 +60,14 @@ ln -s "$HOME" "$T/home-link"
 BD_FAKE_REFUSAL_LOG="$T/ar.log" bd -C "$T/home-link" info >/dev/null 2>&1
 is "a symlink out of the fence is resolved before the check" "97" "$?"
 
+if [[ "$(uname -s)" == Darwin ]]; then
+  # What mktemp uses with no TMPDIR set: a clean shell's temp dir is still a temp dir.
+  DT=$(mktemp -d "$(getconf DARWIN_USER_TEMP_DIR)bd-fake-dt-XXXXXX")
+  (cd "$DT" && env -u TMPDIR bd init --quiet --prefix dt >/dev/null 2>&1)
+  is "with TMPDIR unset, macOS's per-user temp dir is allowed by default" "0" "$?"
+  rm -rf "$DT"
+fi
+
 echo "== BD_FAKE_LOG records every call"
 BD_FAKE_LOG="$T/calls.log" B show --json "$R-none" >/dev/null 2>&1
 (cd "$R" && BD_FAKE_LOG="$T/calls.log" bd list --json --label 'a b' >/dev/null)
