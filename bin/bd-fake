@@ -1,33 +1,38 @@
 #!/usr/bin/env -S python3 -I -S
-"""The test suite's `bd`: a fake, unless AGENTIC_RUN_TEST_REAL_BD=1 hands the call to
-tests/real-bd-guard.sh and the real binary behind it.
+"""bd-fake: a drop-in fake `bd` (Beads) for test suites.
 
-One JSON file per root (<root>/.fake-bd.json), guarded by flock on <root>/.fake-bd.lock
-so the parallel runner's writers serialize. It implements the verbs and flags the
-agentic-run scripts and tests use, with the JSON shapes bd 1.3.0 prints;
-scripts/fake-bd_contract_test.sh diffs those shapes against the real binary. Anything
-else exits 64 with the argv on stderr, so a new use fails loudly instead of passing.
+One JSON file per root (<root>/.bd-fake.json), guarded by flock on <root>/.bd-fake.lock
+so parallel writers serialize. It implements the verbs and flags listed in the README,
+with the JSON shapes bd 1.3.0 prints; tests/contract_test.sh diffs those shapes against
+a real bd. Anything else exits 64 with the argv on stderr, so a new use fails loudly
+instead of passing.
 
-Stdlib only. Python itself, not a bash wrapper around it, because the wrapper's own
+Environment:
+  BD_FAKE_ALLOWED_ROOTS  colon-separated prefixes a root must sit under (default:
+                         $TMPDIR and /tmp). A root outside them is refused with exit 97.
+  BD_FAKE_LOG            when set, every call's argv and cwd are appended to it as one
+                         JSON line; a refused (97) or unsupported (64) call carries
+                         "exit" and "error" too.
+  BD_FAKE_REFUSAL_LOG    when set, each refused or unsupported call is appended to it as
+                         one text line, so a harness can fail a case on a non-empty file
+                         even when the caller swallowed the exit code.
+
+Stdlib only. Python itself, not a bash wrapper around it, because a wrapper's own
 startup was a fifth of every call.
 """
 import os
 import sys
 
-if os.environ.get("AGENTIC_RUN_TEST_REAL_BD") == "1":
-    os.execvp("bash", ["bash", os.path.join(os.path.dirname(os.path.realpath(__file__)),
-                                            "..", "real-bd-guard.sh")] + sys.argv[1:])
+import fcntl
+import json
+import re
+import time
 
-import fcntl  # noqa: E402
-import json  # noqa: E402
-import re  # noqa: E402
-import time  # noqa: E402
-
-VERSION = "1.3.0 (agentic-run fake)"
-ACTOR = "fake-bd"
-OWNER = "fake-bd@example.invalid"
-STORE = ".fake-bd.json"
-LOCK = ".fake-bd.lock"
+VERSION = "1.3.0 (bd-fake)"
+ACTOR = "bd-fake"
+OWNER = "bd-fake@example.invalid"
+STORE = ".bd-fake.json"
+LOCK = ".bd-fake.lock"
 STATUSES = ("open", "in_progress", "blocked", "deferred", "closed", "pinned", "hooked")
 B36 = "0123456789abcdefghijklmnopqrstuvwxyz"
 
@@ -148,22 +153,48 @@ def parse(verb, args):
     return opts, pos
 
 
-# --- the guard ---------------------------------------------------------------
-# The same fence tests/bin/bd's real path keeps: a call whose directory is not under a
-# test temp dir is refused with 97 and logged, and testlib's `report` fails on the log.
-def deny(msg):
-    log = os.environ.get("AGENTIC_RUN_BDGUARD_LOG") or ""
-    line = "bdguard: %s: bd %s\n" % (msg, " ".join(ARGV))
+# --- the fence and the logs -------------------------------------------------
+def log_call(extra=None):
+    path = os.environ.get("BD_FAKE_LOG")
+    if not path:
+        return
+    rec = {"cwd": os.getcwd(), "argv": ARGV}
+    if extra:
+        rec.update(extra)
     try:
-        if log:
-            with open(log, "a") as f:
-                f.write(line)
-        else:
-            sys.stderr.write(line)
+        with open(path, "a") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
     except OSError:
         pass
-    sys.stderr.write("bdguard: %s\n" % msg)
+
+
+def log_refusal(line):
+    path = os.environ.get("BD_FAKE_REFUSAL_LOG")
+    if not path:
+        return False
+    try:
+        with open(path, "a") as f:
+            f.write(line)
+        return True
+    except OSError:
+        return False
+
+
+def deny(msg):
+    """A root this fake must not touch: exit 97, logged."""
+    line = "bd-fake: refused (%s): bd %s\n" % (msg, " ".join(ARGV))
+    log_call({"exit": 97, "error": msg})
+    if not log_refusal(line):
+        sys.stderr.write(line)
+    sys.stderr.write("bd-fake: refused: %s\n" % msg)
     sys.exit(97)
+
+
+def allowed_roots():
+    v = os.environ.get("BD_FAKE_ALLOWED_ROOTS")
+    if v is None:
+        return [os.environ.get("TMPDIR") or "/tmp", "/tmp"]
+    return [p for p in v.split(":") if p]
 
 
 def guarded_root(d):
@@ -171,14 +202,10 @@ def guarded_root(d):
     if not os.path.isdir(d):
         deny("no such directory: %s" % d)
     r = os.path.realpath(d)
-    ok = False
-    for base in (os.environ.get("AGENTIC_RUN_BDGUARD_BASE") or os.environ.get("TMPDIR") or "/tmp",
-                 "/tmp"):
+    for base in allowed_roots():
         if os.path.isdir(base) and r.startswith(os.path.realpath(base).rstrip("/") + "/"):
-            ok = True
-    if not ok:
-        deny("%s is outside the test temp dirs" % r)
-    return r
+            return r
+    deny("%s is outside BD_FAKE_ALLOWED_ROOTS (%s)" % (r, ":".join(allowed_roots())))
 
 
 # --- the store ---------------------------------------------------------------
@@ -437,7 +464,7 @@ def v_init(root, o, p):
     if os.path.exists(meta):
         try:
             with open(meta) as f:
-                ours = json.load(f).get("fake_bd") is True
+                ours = json.load(f).get("bd_fake") is True
         except (OSError, ValueError, AttributeError):
             ours = False
         if not ours:
@@ -453,8 +480,8 @@ def v_init(root, o, p):
     with open(meta, "w") as f:
         json.dump({"database": "dolt", "backend": "dolt", "dolt_mode": "server",
                    "dolt_server_host": "127.0.0.1", "dolt_server_port": 1,
-                   "dolt_server_user": "root", "dolt_database": "agentic_run_fake_bd",
-                   "fake_bd": True}, f, indent=2)
+                   "dolt_server_user": "root", "dolt_database": "bd_fake",
+                   "bd_fake": True}, f, indent=2)
     with open(os.path.join(bdir, "dolt-server.port"), "w") as f:
         f.write("1\n")
     with open(os.path.join(bdir, "config.yaml"), "w") as f:
@@ -935,6 +962,7 @@ VERBS = {
 
 
 def main():
+    log_call()
     d, rest = split_global(ARGV)
     root = guarded_root(d)
     if not rest or rest[0] in ("help", "-h", "--help"):
@@ -954,17 +982,10 @@ if __name__ == "__main__":
     try:
         main()
     except Usage as e:
-        msg = "fake-bd: unsupported (%s): bd %s\n" % (e, " ".join(ARGV))
+        msg = "bd-fake: unsupported (%s): bd %s\n" % (e, " ".join(ARGV))
         sys.stderr.write(msg)
-        # Into the guard log too, which testlib's `report` fails on: a caller that
-        # swallows stderr and the exit code would otherwise pass on a call never made.
-        log = os.environ.get("AGENTIC_RUN_BDGUARD_LOG")
-        if log:
-            try:
-                with open(log, "a") as f:
-                    f.write(msg)
-            except OSError:
-                pass
+        log_call({"exit": 64, "error": "unsupported: %s" % e})
+        log_refusal(msg)
         sys.exit(64)
     except Fail as e:
         sys.stderr.write("Error: %s\n" % e)
