@@ -31,10 +31,17 @@ jobs:
             *) echo "no release for $(uname -s)-$(uname -m)"; exit 1 ;;
           esac
           mkdir -p "$RUNNER_TEMP/tools"
+          # Unpacked whole, then found by name: the tarballs' layouts differ per OS.
+          mkdir -p "$RUNNER_TEMP/unpack"
           curl -fsSL "https://github.com/gastownhall/beads/releases/download/v${BD_VERSION}/beads_${BD_VERSION}_${os}_${arch}.tar.gz" \
-            | tar xz -C "$RUNNER_TEMP/tools" ./bd
+            | tar xz -C "$RUNNER_TEMP/unpack"
           curl -fsSL "https://github.com/dolthub/dolt/releases/download/v${DOLT_VERSION}/dolt-${os}-${arch}.tar.gz" \
-            | tar xz -C "$RUNNER_TEMP/tools" --strip-components 2 "dolt-${os}-${arch}/bin/dolt"
+            | tar xz -C "$RUNNER_TEMP/unpack"
+          for b in bd dolt; do
+            f=$(find "$RUNNER_TEMP/unpack" -type f -name "$b" | head -1)
+            [[ -n "$f" ]] || { echo "no $b in the release tarball"; exit 1; }
+            install -m 0755 "$f" "$RUNNER_TEMP/tools/$b"
+          done
           git config --global user.name "bd-fake CI"
           git config --global user.email "ci@example.invalid"
           dolt config --global --add user.name "bd-fake CI" || true
