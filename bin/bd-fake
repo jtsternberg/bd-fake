@@ -1,0 +1,973 @@
+#!/usr/bin/env -S python3 -I -S
+"""The test suite's `bd`: a fake, unless AGENTIC_RUN_TEST_REAL_BD=1 hands the call to
+tests/real-bd-guard.sh and the real binary behind it.
+
+One JSON file per root (<root>/.fake-bd.json), guarded by flock on <root>/.fake-bd.lock
+so the parallel runner's writers serialize. It implements the verbs and flags the
+agentic-run scripts and tests use, with the JSON shapes bd 1.3.0 prints;
+scripts/fake-bd_contract_test.sh diffs those shapes against the real binary. Anything
+else exits 64 with the argv on stderr, so a new use fails loudly instead of passing.
+
+Stdlib only. Python itself, not a bash wrapper around it, because the wrapper's own
+startup was a fifth of every call.
+"""
+import os
+import sys
+
+if os.environ.get("AGENTIC_RUN_TEST_REAL_BD") == "1":
+    os.execvp("bash", ["bash", os.path.join(os.path.dirname(os.path.realpath(__file__)),
+                                            "..", "real-bd-guard.sh")] + sys.argv[1:])
+
+import fcntl  # noqa: E402
+import json  # noqa: E402
+import re  # noqa: E402
+import time  # noqa: E402
+
+VERSION = "1.3.0 (agentic-run fake)"
+ACTOR = "fake-bd"
+OWNER = "fake-bd@example.invalid"
+STORE = ".fake-bd.json"
+LOCK = ".fake-bd.lock"
+STATUSES = ("open", "in_progress", "blocked", "deferred", "closed", "pinned", "hooked")
+B36 = "0123456789abcdefghijklmnopqrstuvwxyz"
+
+
+class Usage(Exception):
+    """An argv this fake does not implement: exit 64."""
+
+
+class Fail(Exception):
+    """What bd itself would refuse: exit 1."""
+
+
+ARGV = sys.argv[1:]
+
+
+def unsupported(why):
+    raise Usage(why)
+
+
+# --- argument parsing --------------------------------------------------------
+# kinds: bool, str, list (repeatable), csv (repeatable, comma-split like cobra's strings)
+SPECS = {
+    "init": {"non-interactive": "bool", "init-if-missing": "bool", "skip-agents": "bool",
+             "skip-hooks": "bool", "server": "bool", "external": "bool", "quiet": "bool",
+             "prefix": "str", "server-host": "str", "server-port": "str",
+             "server-user": "str", "database": "str"},
+    "info": {"json": "bool"},
+    "version": {},
+    "create": {"silent": "bool", "json": "bool", "no-inherit-labels": "bool", "type": "str",
+               "priority": "str", "title": "str", "description": "str", "parent": "str",
+               "status": "str", "labels": "csv", "metadata": "str", "deps": "csv"},
+    "show": {"json": "bool"},
+    "list": {"json": "bool", "all": "bool", "label": "csv", "metadata-field": "list",
+             "parent": "str", "limit": "str"},
+    "update": {"json": "bool", "force": "bool", "set-metadata": "list",
+               "unset-metadata": "list", "append-notes": "str", "status": "str",
+               "add-label": "csv", "remove-label": "csv", "set-labels": "csv"},
+    "close": {"json": "bool", "force": "bool", "reason": "str"},
+    "delete": {"json": "bool", "force": "bool"},
+    "note": {"json": "bool"},
+    "comments": {"json": "bool"},
+    "comments add": {"json": "bool"},
+    "gate create": {"json": "bool", "type": "str", "blocks": "str", "await-id": "str",
+                    "reason": "str"},
+    "gate resolve": {"json": "bool", "reason": "str"},
+    "gate list": {"json": "bool"},
+    "dep add": {"json": "bool", "type": "str"},
+    "dep remove": {"json": "bool"},
+    "ready": {"json": "bool", "parent": "str", "label": "csv", "limit": "str"},
+    "audit record": {"kind": "str", "issue-id": "str", "response": "str", "tool-name": "str"},
+}
+SUBVERBS = {"gate": ("create", "resolve", "list"), "dep": ("add", "remove"),
+            "audit": ("record",), "comments": ("add",)}
+
+
+def split_global(argv):
+    """-C/--directory and the guard's refusals, wherever they sit; the rest in order."""
+    d, rest, i = None, [], 0
+    while i < len(argv):
+        a = argv[i]
+        if a in ("-C", "--directory"):
+            if i + 1 >= len(argv):
+                unsupported("-C needs a directory")
+            d = argv[i + 1]
+            i += 2
+            continue
+        if a.startswith("--directory="):
+            d = a.split("=", 1)[1]
+        elif a == "--db" or a.startswith("--db="):
+            deny("--db names a store by path, around the -C this guard checks")
+        elif a == "--global":
+            deny("--global is the shared server's database")
+        elif a == "--version":
+            rest.append("version")
+        else:
+            rest.append(a)
+        i += 1
+    return d, rest
+
+
+def parse(verb, args):
+    spec = SPECS.get(verb)
+    if spec is None:
+        unsupported("verb '%s'" % verb)
+    opts, pos, i = {}, [], 0
+    while i < len(args):
+        a = args[i]
+        if a == "--":
+            pos.extend(args[i + 1:])
+            break
+        if a.startswith("--") and len(a) > 2:
+            name, eq, val = a[2:].partition("=")
+            kind = spec.get(name)
+            if kind is None:
+                unsupported("flag --%s for '%s'" % (name, verb))
+            if kind == "bool":
+                if eq and val not in ("true", "false"):
+                    unsupported("--%s=%s" % (name, val))
+                opts[name] = (val != "false")
+            else:
+                if not eq:
+                    if i + 1 >= len(args):
+                        raise Fail("flag needs an argument: --%s" % name)
+                    i += 1
+                    val = args[i]
+                if kind == "str":
+                    opts[name] = val
+                elif kind == "list":
+                    opts.setdefault(name, []).append(val)
+                else:
+                    opts.setdefault(name, []).extend(v for v in val.split(",") if v != "")
+            i += 1
+            continue
+        if a.startswith("-") and len(a) > 1:
+            unsupported("flag %s for '%s'" % (a, verb))
+        pos.append(a)
+        i += 1
+    return opts, pos
+
+
+# --- the guard ---------------------------------------------------------------
+# The same fence tests/bin/bd's real path keeps: a call whose directory is not under a
+# test temp dir is refused with 97 and logged, and testlib's `report` fails on the log.
+def deny(msg):
+    log = os.environ.get("AGENTIC_RUN_BDGUARD_LOG") or ""
+    line = "bdguard: %s: bd %s\n" % (msg, " ".join(ARGV))
+    try:
+        if log:
+            with open(log, "a") as f:
+                f.write(line)
+        else:
+            sys.stderr.write(line)
+    except OSError:
+        pass
+    sys.stderr.write("bdguard: %s\n" % msg)
+    sys.exit(97)
+
+
+def guarded_root(d):
+    d = d if d is not None else os.getcwd()
+    if not os.path.isdir(d):
+        deny("no such directory: %s" % d)
+    r = os.path.realpath(d)
+    ok = False
+    for base in (os.environ.get("AGENTIC_RUN_BDGUARD_BASE") or os.environ.get("TMPDIR") or "/tmp",
+                 "/tmp"):
+        if os.path.isdir(base) and r.startswith(os.path.realpath(base).rstrip("/") + "/"):
+            ok = True
+    if not ok:
+        deny("%s is outside the test temp dirs" % r)
+    return r
+
+
+# --- the store ---------------------------------------------------------------
+class Store:
+    def __init__(self, root, write):
+        self.root, self.write = root, write
+        self.path = os.path.join(root, STORE)
+        self.lockf = open(os.path.join(root, LOCK), "a")
+        fcntl.flock(self.lockf, fcntl.LOCK_EX if write else fcntl.LOCK_SH)
+        with open(self.path) as f:
+            self.d = json.load(f)
+        self.issues = self.d["issues"]
+        self.deps = self.d["deps"]
+
+    def save(self):
+        tmp = "%s.%d.tmp" % (self.path, os.getpid())
+        with open(tmp, "w") as f:
+            json.dump(self.d, f, separators=(",", ":"))
+        os.replace(tmp, self.path)
+
+    def get(self, ident):
+        i = self.issues.get(ident)
+        if i is None:
+            raise Fail('no issue found matching "%s"' % ident)
+        return i
+
+    def next_seq(self):
+        self.d["seq"] += 1
+        return self.d["seq"]
+
+    def new_top_id(self):
+        n = 3
+        while True:
+            for _ in range(40):
+                s = "".join(B36[b % 36] for b in os.urandom(n))
+                ident = "%s-%s" % (self.d["prefix"], s)
+                if ident not in self.issues:
+                    return ident
+            n += 1
+
+    def parent_of(self, ident):
+        for d in self.deps:
+            if d["issue_id"] == ident and d["type"] == "parent-child":
+                return d["depends_on_id"]
+        return None
+
+    def children(self, ident):
+        return [d["issue_id"] for d in self.deps
+                if d["depends_on_id"] == ident and d["type"] == "parent-child"]
+
+    def open_blockers(self, ident):
+        return [d["depends_on_id"] for d in self.deps
+                if d["issue_id"] == ident and d["type"] == "blocks"
+                and self.issues[d["depends_on_id"]]["status"] != "closed"]
+
+    def add_dep(self, a, b, typ):
+        for d in self.deps:
+            if d["issue_id"] == a and d["depends_on_id"] == b:
+                return
+        self.deps.append({"issue_id": a, "depends_on_id": b, "type": typ, "created_at": now()})
+
+
+def now():
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def open_store(root, write):
+    if not os.path.isfile(os.path.join(root, STORE)):
+        deny("no beads store at %s" % root)
+    return Store(root, write)
+
+
+# --- rendering ---------------------------------------------------------------
+def dumps(obj):
+    # Go's encoder escapes these; jq reads either spelling, but a grep of raw output would not.
+    s = json.dumps(obj, indent=2, ensure_ascii=False)
+    return (s.replace("<", "\\u003c").replace(">", "\\u003e").replace("&", "\\u0026")
+            .replace("\u2028", "\\u2028").replace("\u2029", "\\u2029"))
+
+
+def out_json(obj):
+    sys.stdout.write(dumps(obj) + "\n")
+
+
+def base(i):
+    o = {"id": i["id"], "title": i["title"]}
+    for k in ("description", "notes"):
+        if i.get(k):
+            o[k] = i[k]
+    o.update(status=i["status"], priority=i["priority"], issue_type=i["issue_type"], owner=OWNER,
+             created_at=i["created_at"], created_by=ACTOR, updated_at=i["updated_at"])
+    for k in ("closed_at", "close_reason", "await_type", "await_id"):
+        if i.get(k):
+            o[k] = i[k]
+    if i.get("metadata"):
+        o["metadata"] = dict(sorted(i["metadata"].items()))
+    if i.get("labels"):
+        o["labels"] = sorted(i["labels"])
+    return o
+
+
+def comment_count(st, ident):
+    return sum(1 for c in st.d["comments"] if c["issue_id"] == ident)
+
+
+def show_row(st, i):
+    o = base(i)
+    deps = [d for d in st.deps if d["issue_id"] == i["id"]]
+    if deps:
+        rows = []
+        for d in deps:
+            r = base(st.issues[d["depends_on_id"]])
+            r["dependency_type"] = d["type"]
+            rows.append(r)
+        o["dependencies"] = rows
+    p = st.parent_of(i["id"])
+    if p:
+        o["parent"] = p
+    o["dependent_count"] = sum(1 for d in st.deps if d["depends_on_id"] == i["id"])
+    o["dependency_count"] = len(deps)
+    o["comment_count"] = comment_count(st, i["id"])
+    if o["comment_count"]:
+        o["comments_omitted"] = True
+    o["revision"] = str(i.get("rev", 0))
+    return o
+
+
+def list_row(st, i):
+    o = base(i)
+    deps = [d for d in st.deps if d["issue_id"] == i["id"]]
+    if deps:
+        o["dependencies"] = [{"issue_id": d["issue_id"], "depends_on_id": d["depends_on_id"],
+                              "type": d["type"], "created_at": d["created_at"],
+                              "created_by": ACTOR, "metadata": "{}"} for d in deps]
+    # list counts blocking links only; show counts every link.
+    o["dependency_count"] = sum(1 for d in deps if d["type"] == "blocks")
+    o["dependent_count"] = sum(1 for d in st.deps
+                               if d["depends_on_id"] == i["id"] and d["type"] == "blocks")
+    o["comment_count"] = comment_count(st, i["id"])
+    p = st.parent_of(i["id"])
+    if p:
+        o["parent"] = p
+    return o
+
+
+# --- values ------------------------------------------------------------------
+def coerce(v):
+    """bd stores a --set-metadata value that parses as a JSON scalar as that scalar."""
+    s = v.strip()
+    if not s or not (s in ("true", "false", "null") or s[0] == "-" or s[0].isdigit()):
+        return v
+    try:
+        x = json.loads(s)
+    except ValueError:
+        return v
+    if x is None or isinstance(x, bool):
+        return x
+    if isinstance(x, float):
+        if x != x or x in (float("inf"), float("-inf")):
+            return v
+        if x.is_integer() and abs(x) < 1e21:
+            return int(x)
+    if isinstance(x, (int, float)):
+        return x
+    return v
+
+
+def as_text(v):
+    if isinstance(v, str):
+        return v
+    return json.dumps(v)
+
+
+def metadata_filters(pairs):
+    out = []
+    for p in pairs or []:
+        k, eq, v = p.partition("=")
+        if not eq or not k:
+            raise Fail('invalid --metadata-field: expected key=value, got "%s"' % p)
+        out.append((k, v))
+    return out
+
+
+def meta_match(i, filters):
+    m = i.get("metadata") or {}
+    return all(k in m and as_text(m[k]) == v for k, v in filters)
+
+
+def int_flag(v, name, default):
+    if v is None:
+        return default
+    try:
+        return int(v)
+    except ValueError:
+        raise Fail('invalid argument "%s" for "--%s"' % (v, name))
+
+
+def priority(v):
+    if v is None:
+        return 2
+    s = v[1:] if v[:1] in ("P", "p") else v
+    if not s.isdigit() or int(s) > 4:
+        raise Fail("invalid priority %s" % v)
+    return int(s)
+
+
+def touch(i):
+    i["updated_at"] = now()
+    i["rev"] = i.get("rev", 0) + 1
+
+
+def set_status(st, i, status, force, reason=None):
+    if status not in STATUSES:
+        raise Fail('invalid status "%s"' % status)
+    if status == "closed":
+        if i["status"] == "closed":
+            return
+        if not force:
+            bl = st.open_blockers(i["id"])
+            if bl:
+                raise Fail("cannot close blocked issue: %s is blocked by [%s]" % (i["id"], " ".join(bl)))
+            kids = [c for c in st.children(i["id"]) if st.issues[c]["status"] != "closed"]
+            if kids:
+                raise Fail("cannot close %s: %d open child issue(s); close children first or use --force to override"
+                           % (i["id"], len(kids)))
+        i["status"] = "closed"
+        i["closed_at"] = now()
+        if reason:
+            i["close_reason"] = reason
+        else:
+            i.pop("close_reason", None)
+    else:
+        i["status"] = status
+        i.pop("closed_at", None)
+        i.pop("close_reason", None)
+
+
+def append_notes(i, text):
+    i["notes"] = (i["notes"] + "\n" + text) if i.get("notes") else text
+
+
+# --- verbs -------------------------------------------------------------------
+def v_version(root, o, p):
+    print("bd version %s" % VERSION)
+
+
+def v_init(root, o, p):
+    store = os.path.join(root, STORE)
+    if os.path.isfile(store):
+        if not o.get("quiet"):
+            print("bd is already initialized in %s" % root)
+        return
+    prefix = o.get("prefix") or os.path.basename(root).lstrip(".") or "bd"
+    bdir = os.path.join(root, ".beads")
+    meta = os.path.join(bdir, "metadata.json")
+    if os.path.exists(meta):
+        try:
+            with open(meta) as f:
+                ours = json.load(f).get("fake_bd") is True
+        except (OSError, ValueError, AttributeError):
+            ours = False
+        if not ours:
+            deny("%s is a real bd store's; init would point it at the fake" % meta)
+    os.makedirs(bdir, mode=0o700, exist_ok=True)
+    # Port 1: a real bd that ends up pointed at this root (a case that execs the real
+    # binary past the fake) gets "connection refused" instead of finding no store and
+    # falling back to the CALLER's database (gastownhall/beads#5756). bd 1.3.0 reads the
+    # port file first and calls metadata's port deprecated, so both carry it. With only
+    # the port file, bd tries to start a server on port 1 itself; auto-start off makes
+    # that a plain refusal too, and with neither port it dials port 0 rather than
+    # starting a server or reaching the shared one on 3308.
+    with open(meta, "w") as f:
+        json.dump({"database": "dolt", "backend": "dolt", "dolt_mode": "server",
+                   "dolt_server_host": "127.0.0.1", "dolt_server_port": 1,
+                   "dolt_server_user": "root", "dolt_database": "agentic_run_fake_bd",
+                   "fake_bd": True}, f, indent=2)
+    with open(os.path.join(bdir, "dolt-server.port"), "w") as f:
+        f.write("1\n")
+    with open(os.path.join(bdir, "config.yaml"), "w") as f:
+        f.write("dolt:\n  auto-start: false\n")
+    tmp = store + ".%d.tmp" % os.getpid()
+    with open(tmp, "w") as f:
+        json.dump({"prefix": prefix, "seq": 0, "issues": {}, "deps": [], "comments": [],
+                   "children": {}}, f)
+    os.replace(tmp, store)
+    if not o.get("quiet"):
+        print("✓ bd initialized successfully!\n\n  Backend: fake\n  Issue prefix: %s" % prefix)
+
+
+def v_info(root, o, p):
+    st = open_store(root, False)
+    n = len(st.issues)
+    if o.get("json"):
+        out_json({"database_path": st.path, "issue_count": n, "mode": "fake", "schema_version": 1})
+        return
+    print("\nBeads Database Information\n===========================\nDatabase: %s\nMode: fake\n\nIssue Count: %d\n"
+          % (st.path, n))
+
+
+def v_create(root, o, p):
+    title = o.get("title") or (p[0] if p else "")
+    if not title or len(p) > (0 if o.get("title") else 1):
+        raise Fail("title required" if not title else "unexpected arguments: %s" % " ".join(p))
+    st = open_store(root, True)
+    meta = {}
+    if "metadata" in o:
+        raw = o["metadata"]
+        if raw.startswith("@"):
+            with open(raw[1:]) as f:
+                raw = f.read()
+        try:
+            meta = json.loads(raw)
+        except ValueError:
+            raise Fail("invalid --metadata JSON")
+        if not isinstance(meta, dict):
+            raise Fail("--metadata must be a JSON object")
+    parent = o.get("parent")
+    labels = set(o.get("labels", []))
+    if parent:
+        pi = st.get(parent)
+        n = st.d["children"].get(parent, 0) + 1
+        st.d["children"][parent] = n
+        ident = "%s.%d" % (parent, n)
+        if not o.get("no-inherit-labels"):
+            labels |= set(pi.get("labels", []))
+    else:
+        ident = st.new_top_id()
+    deps = []
+    for spec in o.get("deps", []):
+        typ, sep, target = spec.partition(":")
+        if not sep:
+            typ, target = "blocks", spec
+        elif typ in ("depends-on", "blocked-by"):
+            typ = "blocks"
+        elif typ == "blocks":
+            unsupported("--deps blocks:<id> (the reverse direction)")
+        st.get(target)
+        deps.append((target, typ))
+    status = o.get("status", "open")
+    if status not in STATUSES:
+        raise Fail('invalid status "%s"' % status)
+    ts = now()
+    i = {"id": ident, "title": title, "description": o.get("description", ""), "notes": "",
+         "status": status, "priority": priority(o.get("priority")),
+         "issue_type": o.get("type", "task"), "created_at": ts, "updated_at": ts,
+         "metadata": meta, "labels": sorted(labels), "seq": st.next_seq(), "rev": 0}
+    if status == "closed":
+        i["closed_at"] = ts
+    st.issues[ident] = i
+    # bd lists a new issue's --deps by id, then its parent; later links follow in order.
+    for target, typ in sorted(deps):
+        st.add_dep(ident, target, typ)
+    if parent:
+        st.add_dep(ident, parent, "parent-child")
+    st.save()
+    if o.get("silent"):
+        print(ident)
+    elif o.get("json"):
+        out_json(base(i))
+    else:
+        print("✓ Created issue: %s — %s\n  Priority: P%d\n  Status: %s" % (ident, title, i["priority"], status))
+
+
+def v_show(root, o, p):
+    if not p:
+        raise Fail("show needs an issue id")
+    st = open_store(root, False)
+    rows, missing = [], []
+    for ident in p:
+        if ident in st.issues:
+            rows.append(show_row(st, st.issues[ident]))
+        else:
+            missing.append(ident)
+    for ident in missing:
+        sys.stderr.write("Issue %s not found\nHint: this ID may have never existed, or may reference a "
+                         "deleted/purged record with no trace left in the live database — try "
+                         "'bd history %s'\n" % (ident, ident))
+    if missing and not rows:
+        if o.get("json"):
+            out_json({"error": "no issues found matching the provided IDs",
+                      "hint": "some IDs may reference deleted/purged records with no trace left in the live database — try 'bd history <id>' to check",
+                      "schema_version": 1})
+        sys.exit(1)
+    if not o.get("json"):
+        unsupported("show without --json (bd's text formatter)")
+    out_json(rows)
+
+
+def v_list(root, o, p):
+    if p:
+        unsupported("list with positional arguments")
+    if not o.get("json"):
+        unsupported("list without --json (bd's text formatter)")
+    filters = metadata_filters(o.get("metadata-field"))
+    # bd 1.3.0 applies its 50-row default only when stdout is a terminal (probed with
+    # 60 issues piped: all 60).
+    limit = int_flag(o.get("limit"), "limit", 50 if sys.stdout.isatty() else 0)
+    st = open_store(root, False)
+    want = set(o.get("label", []))
+    parent = o.get("parent")
+    rows = []
+    for i in st.issues.values():
+        if i["issue_type"] == "gate":
+            continue
+        if not o.get("all") and i["status"] == "closed":
+            continue
+        if parent and st.parent_of(i["id"]) != parent:
+            continue
+        if not want <= set(i.get("labels", [])):
+            continue
+        if not meta_match(i, filters):
+            continue
+        rows.append(i)
+    rows.sort(key=lambda i: (i["priority"], -i["seq"]))
+    if limit > 0:
+        rows = rows[:limit]
+    out_json([list_row(st, i) for i in rows])
+
+
+def v_update(root, o, p):
+    if not p:
+        raise Fail("update needs an issue id")
+    sets = []
+    for kv in o.get("set-metadata", []):
+        k, eq, v = kv.partition("=")
+        if not eq or not k:
+            raise Fail('invalid --set-metadata: expected key=value, got "%s"' % kv)
+        sets.append((k, coerce(v)))
+    keys = ("set-metadata", "unset-metadata", "append-notes", "status", "add-label",
+            "remove-label", "set-labels")
+    if not any(k in o for k in keys):
+        print("No updates specified")
+        return
+    st = open_store(root, True)
+    failed = []
+    for ident in p:
+        try:
+            # On a copy: a refusal (a close bd will not make) must leave nothing half-applied.
+            i = json.loads(json.dumps(st.get(ident)))
+            if "set-labels" in o:
+                i["labels"] = sorted(set(o["set-labels"]))
+            lab = set(i.get("labels", [])) | set(o.get("add-label", []))
+            lab -= set(o.get("remove-label", []))
+            i["labels"] = sorted(lab)
+            for k, v in sets:
+                i["metadata"][k] = v
+            for k in o.get("unset-metadata", []):
+                i["metadata"].pop(k, None)
+            if "append-notes" in o:
+                append_notes(i, o["append-notes"])
+            if "status" in o:
+                set_status(st, i, o["status"], o.get("force"))
+            touch(i)
+            st.issues[ident] = i
+            print("✓ Updated issue: %s — %s" % (i["id"], i["title"]))
+        except Fail as e:
+            failed.append((ident, str(e)))
+    if failed:
+        # bd applies an update per issue; with one id a refusal means nothing changed.
+        if len(failed) < len(p):
+            st.save()
+        for ident, msg in failed:
+            sys.stderr.write("Error updating %s: %s\n" % (ident, msg))
+        raise Fail("%d of %d issues failed to update" % (len(failed), len(p)))
+    st.save()
+
+
+def v_close(root, o, p):
+    if not p:
+        raise Fail("close needs an issue id")
+    st = open_store(root, True)
+    for ident in p:
+        if ident not in st.issues:
+            raise Fail('resolving ID %s: no issue found matching "%s"' % (ident, ident))
+    closed = 0
+    for ident in p:
+        i = st.issues[ident]
+        kids = [c for c in st.children(ident) if st.issues[c]["status"] != "closed"]
+        try:
+            set_status(st, i, "closed", o.get("force"), o.get("reason") or "Closed")
+        except Fail as e:
+            # bd prints a refusal bare and moves on; the call fails only when none closed.
+            sys.stderr.write("%s (use --force to override)\n" % e if "blocked" in str(e) else "%s\n" % e)
+            continue
+        if kids and o.get("force"):
+            sys.stderr.write("warning: closing %s with %d open child issue(s) still active\n" % (ident, len(kids)))
+        touch(i)
+        closed += 1
+        print("✓ Closed %s — %s: %s" % (ident, i["title"], i.get("close_reason", "Closed")))
+    if not closed:
+        sys.exit(1)
+    st.save()
+
+
+def v_delete(root, o, p):
+    if not p:
+        raise Fail("delete needs an issue id")
+    st = open_store(root, True)
+    for ident in p:
+        if ident not in st.issues:
+            raise Fail("issue %s not found" % ident)
+    if not o.get("force"):
+        print("\n⚠️  DELETE PREVIEW\n\nIssues to delete (%d):" % len(p))
+        for ident in p:
+            print("  %s: %s" % (ident, st.issues[ident]["title"]))
+        if any(d["depends_on_id"] in p and d["issue_id"] not in p for d in st.deps):
+            raise Fail("issue has dependents not in deletion set; use --cascade to delete them or --force to orphan them")
+        return
+    for ident in p:
+        n = sum(1 for d in st.deps if ident in (d["issue_id"], d["depends_on_id"]))
+        st.deps[:] = [d for d in st.deps if ident not in (d["issue_id"], d["depends_on_id"])]
+        st.d["comments"] = [c for c in st.d["comments"] if c["issue_id"] != ident]
+        del st.issues[ident]
+        # bd rewrites mentions of a deleted id in the text of the issues left behind.
+        pat = re.compile(r"(?<![\w.-])" + re.escape(ident) + r"(?!\.?\w)")
+        touched = 0
+        for other in st.issues.values():
+            changed = False
+            for k in ("title", "description", "notes"):
+                if other.get(k) and pat.search(other[k]):
+                    other[k] = pat.sub("[deleted:%s]" % ident, other[k])
+                    changed = True
+            touched += changed
+        print("✓ Deleted %s\n  Removed %d dependency link(s)" % (ident, n))
+        if touched:
+            print("  Updated text references in %d issue(s)" % touched)
+    st.save()
+
+
+def v_note(root, o, p):
+    if len(p) < 2:
+        raise Fail("note needs an issue id and text")
+    st = open_store(root, True)
+    i = st.get(p[0])
+    append_notes(i, " ".join(p[1:]))
+    touch(i)
+    st.save()
+    print("✓ Note added to %s — %s" % (i["id"], i["title"]))
+
+
+def v_comments(root, o, p):
+    if len(p) != 1:
+        raise Fail("comments needs one issue id")
+    st = open_store(root, False)
+    if p[0] not in st.issues:
+        if o.get("json"):
+            out_json({"error": 'resolving %s: no issue found matching "%s"' % (p[0], p[0]),
+                      "schema_version": 1})
+        raise Fail('resolving %s: no issue found matching "%s"' % (p[0], p[0]))
+    cs = [c for c in st.d["comments"] if c["issue_id"] == p[0]]
+    if o.get("json"):
+        out_json(cs)
+        return
+    if not cs:
+        print("No comments on %s" % p[0])
+        return
+    lines = ["", "Comments on %s:" % p[0], ""]
+    for c in cs:
+        lines.append("[%s] at %s %s" % (c["author"], c["created_at"][:10], c["created_at"][11:16]))
+        lines.append("  ")
+        lines.extend("    " + ln.ljust(76) for ln in c["text"].split("\n"))
+        lines.append("")
+    print("\n".join(lines))
+
+
+def v_comments_add(root, o, p):
+    if len(p) != 2:
+        raise Fail("comments add needs an issue id and the text")
+    st = open_store(root, True)
+    i = st.get(p[0])
+    h = os.urandom(16).hex()
+    st.d["comments"].append({"id": "%s-%s-%s-%s-%s" % (h[:8], h[8:12], h[12:16], h[16:20], h[20:]),
+                             "issue_id": i["id"], "author": ACTOR, "text": p[1],
+                             "created_at": now()})
+    st.save()
+    print("Comment added to %s" % i["id"])
+
+
+def v_gate_create(root, o, p):
+    if p:
+        unsupported("gate create with positional arguments")
+    typ, blocks = o.get("type"), o.get("blocks")
+    if not typ or not blocks:
+        raise Fail("gate create needs --type and --blocks")
+    st = open_store(root, True)
+    if blocks not in st.issues:
+        raise Fail("issue not found: %s" % blocks)
+    b = st.issues[blocks]
+    aw = o.get("await-id", "")
+    ident = st.new_top_id()
+    desc = "Ad-hoc gate blocking %s" % blocks
+    if o.get("reason"):
+        desc += "\n\nReason: %s" % o["reason"]
+    ts = now()
+    st.issues[ident] = {"id": ident, "title": "Gate: %s%s" % (typ, " " + aw if aw else ""),
+                        "description": desc, "notes": "", "status": "open", "priority": 2,
+                        "issue_type": "gate", "created_at": ts, "updated_at": ts,
+                        "metadata": {}, "labels": [], "await_type": typ, "await_id": aw,
+                        "seq": st.next_seq(), "rev": 0}
+    st.add_dep(blocks, ident, "blocks")
+    st.save()
+    print("✓ Created gate %s (type: %s)\n  Blocks: %s (%s)" % (ident, typ, blocks, b["title"]))
+    if o.get("reason"):
+        print("  Reason: %s" % o["reason"])
+    print("\nResolve with: bd gate resolve %s" % ident)
+
+
+def v_gate_resolve(root, o, p):
+    if len(p) != 1:
+        raise Fail("gate resolve needs one gate id")
+    st = open_store(root, True)
+    i = st.get(p[0])
+    if i["issue_type"] != "gate":
+        raise Fail("%s is not a gate" % p[0])
+    if i["status"] != "closed":
+        set_status(st, i, "closed", True, o.get("reason"))
+        touch(i)
+        st.save()
+    print("✓ Gate resolved: %s" % i["id"])
+    if o.get("reason"):
+        print("  Reason: %s" % o["reason"])
+
+
+def v_gate_list(root, o, p):
+    if not o.get("json"):
+        unsupported("gate list without --json (bd's text formatter)")
+    st = open_store(root, False)
+    rows = [i for i in st.issues.values() if i["issue_type"] == "gate" and i["status"] != "closed"]
+    rows.sort(key=lambda i: i["seq"], reverse=True)
+    # bd prints null, not [], when no gate is open.
+    out_json([base(i) for i in rows] or None)
+
+
+def ancestors(st, ident):
+    out, p = [], st.parent_of(ident)
+    while p and p not in out:
+        out.append(p)
+        p = st.parent_of(p)
+    return out
+
+
+def blocks_path(st, src, dst):
+    """Whether src already waits on dst through blocks links, whatever their status."""
+    seen, todo = set(), [src]
+    while todo:
+        x = todo.pop()
+        if x == dst:
+            return True
+        if x in seen:
+            continue
+        seen.add(x)
+        todo.extend(d["depends_on_id"] for d in st.deps if d["issue_id"] == x and d["type"] == "blocks")
+    return False
+
+
+def check_dep_add(st, a, b, typ):
+    """bd's refusals for `dep add a b`, in the order it makes them."""
+    if a == b:
+        raise Fail("cannot add self-dependency: %s cannot depend on itself" % a)
+    if b in ancestors(st, a):
+        raise Fail("cannot add dependency: %s is already a child of %s. Children inherit dependency on "
+                   "parent completion via hierarchy. Adding an explicit dependency would create a deadlock"
+                   % (a, b))
+    if typ == "blocks" and b in descendants(st, a):
+        raise Fail("%s cannot be blocked by its descendant %s: blocked status cascades to descendants, "
+                   "so %s would inherit the block and never close" % (a, b, b))
+    for d in st.deps:
+        if d["issue_id"] == a and d["depends_on_id"] == b and d["type"] != typ:
+            raise Fail("dependency %s -> %s already exists with type \"%s\" (requested \"%s\"); remove it "
+                       "first with 'bd dep remove' then re-add" % (a, b, d["type"], typ))
+    if typ == "blocks" and blocks_path(st, b, a):
+        raise Fail("adding dependency would create a cycle")
+
+
+def v_dep(root, o, p, add):
+    if len(p) != 2:
+        raise Fail("dep needs two issue ids")
+    st = open_store(root, True)
+    for ident in p:
+        if ident not in st.issues:
+            raise Fail('resolving issue ID %s: no issue found matching "%s"' % (ident, ident))
+    a, b = st.issues[p[0]], st.issues[p[1]]
+    if add:
+        typ = o.get("type", "blocks")
+        check_dep_add(st, a["id"], b["id"], typ)
+        st.add_dep(a["id"], b["id"], typ)
+        print("✓ Added dependency: %s (%s) depends on %s (%s) (%s)" % (a["id"], a["title"], b["id"], b["title"], typ))
+    else:
+        st.deps[:] = [d for d in st.deps if not (d["issue_id"] == a["id"] and d["depends_on_id"] == b["id"])]
+        print("✓ Removed dependency: %s (%s) → %s (%s)" % (a["id"], a["title"], b["id"], b["title"]))
+    st.save()
+
+
+def descendants(st, ident):
+    out, todo = set(), [ident]
+    while todo:
+        for c in st.children(todo.pop()):
+            if c not in out:
+                out.add(c)
+                todo.append(c)
+    return out
+
+
+def v_ready(root, o, p):
+    if p:
+        unsupported("ready with positional arguments")
+    if not o.get("json"):
+        unsupported("ready without --json (bd's text formatter)")
+    limit = int_flag(o.get("limit"), "limit", 100)
+    st = open_store(root, False)
+    scope = descendants(st, o["parent"]) if o.get("parent") else None
+    want = set(o.get("label", []))
+    rows = [i for i in st.issues.values()
+            if i["issue_type"] != "gate" and i["status"] == "open"
+            and (scope is None or i["id"] in scope)
+            and want <= set(i.get("labels", []))
+            and not any(st.open_blockers(x) for x in [i["id"]] + ancestors(st, i["id"]))]
+    rows.sort(key=lambda i: (i["priority"], i["seq"]))
+    if limit > 0:
+        rows = rows[:limit]
+    out_json([list_row(st, i) for i in rows])
+
+
+def v_audit_record(root, o, p):
+    if p:
+        unsupported("audit record with positional arguments")
+    if os.environ.get("BD_AUDIT_ENABLED", "").lower() not in ("1", "true", "yes", "on"):
+        raise Fail("audit JSONL sidecar is disabled; set audit.enabled=true or BD_AUDIT_ENABLED=1 to write interactions.jsonl")
+    if not o.get("kind"):
+        raise Fail("--kind is required")
+    st = open_store(root, True)
+    t = time.time()
+    e = {"id": "int-" + os.urandom(16).hex(), "kind": o["kind"],
+         "created_at": time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(t)) + ".%06dZ" % int((t % 1) * 1e6),
+         "actor": ACTOR}
+    for k, f in (("issue_id", "issue-id"), ("response", "response"), ("tool_name", "tool-name")):
+        if o.get(f):
+            e[k] = o[f]
+    with open(os.path.join(st.root, ".beads", "interactions.jsonl"), "a") as f:
+        f.write(json.dumps(e, ensure_ascii=False, separators=(",", ":")) + "\n")
+    print(e["id"])
+
+
+VERBS = {
+    "version": v_version, "init": v_init, "info": v_info, "create": v_create,
+    "show": v_show, "list": v_list, "update": v_update, "close": v_close,
+    "delete": v_delete, "note": v_note, "comments": v_comments,
+    "comments add": v_comments_add, "gate create": v_gate_create,
+    "gate resolve": v_gate_resolve, "gate list": v_gate_list,
+    "dep add": lambda r, o, p: v_dep(r, o, p, True),
+    "dep remove": lambda r, o, p: v_dep(r, o, p, False),
+    "ready": v_ready, "audit record": v_audit_record,
+}
+
+
+def main():
+    d, rest = split_global(ARGV)
+    root = guarded_root(d)
+    if not rest or rest[0] in ("help", "-h", "--help"):
+        unsupported("help")
+    verb, args = rest[0], rest[1:]
+    if verb in SUBVERBS and args and args[0] in SUBVERBS[verb]:
+        verb, args = "%s %s" % (verb, args[0]), args[1:]
+    elif verb in SUBVERBS and verb != "comments":
+        unsupported("'%s' needs one of: %s" % (verb, ", ".join(SUBVERBS[verb])))
+    if verb not in VERBS:
+        unsupported("verb '%s'" % verb)
+    opts, pos = parse(verb, args)
+    VERBS[verb](root, opts, pos)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Usage as e:
+        msg = "fake-bd: unsupported (%s): bd %s\n" % (e, " ".join(ARGV))
+        sys.stderr.write(msg)
+        # Into the guard log too, which testlib's `report` fails on: a caller that
+        # swallows stderr and the exit code would otherwise pass on a call never made.
+        log = os.environ.get("AGENTIC_RUN_BDGUARD_LOG")
+        if log:
+            try:
+                with open(log, "a") as f:
+                    f.write(msg)
+            except OSError:
+                pass
+        sys.exit(64)
+    except Fail as e:
+        sys.stderr.write("Error: %s\n" % e)
+        sys.exit(1)
+    except BrokenPipeError:
+        sys.exit(141)
