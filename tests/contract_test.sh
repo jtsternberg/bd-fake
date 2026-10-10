@@ -47,7 +47,7 @@ mkdir -p "$T/realbin"; ln -s "$REAL" "$T/realbin/bd"
 # Every step prints `### <label> rc=<n>` and then what is compared: JSON as bd printed
 # it, or a line of facts drawn from text output. `### id <name> <value>` lines teach
 # the normalizer which id is which.
-step() { # <label> <kind: json|rc|first|count|db|has:<text>> <cmd...>
+step() { # <label> <kind: json|rc|first|count|db|has:<text>> <cmd...>; returns the command's rc
   local label="$1" kind="$2" out rc; shift 2
   out=$("$@" 2>/dev/null); rc=$?
   printf '### %s rc=%s\n' "$label" "$rc"
@@ -59,15 +59,19 @@ step() { # <label> <kind: json|rc|first|count|db|has:<text>> <cmd...>
     db)    grep -q '^Database: ' <<<"$out" && echo "has a Database line" ;;
     has:*) [[ "$out" == *"${kind#has:}"* ]] && echo "carries ${kind#has:}" ;;
   esac
+  return "$rc"
 }
 calls() { # <root>
   local R="$1" E T1 T2 T3 T4 T5 G H X
   B() { bd -C "$R" "$@"; }
   in_dir() { local d="$1"; shift; (cd "$d" && "$@"); }
   mkdir -p "$R"
+  # Past a failed init, every call below would be answered from whatever database bd
+  # falls back to (gastownhall/beads#5756), so the side stops here instead.
   step init rc in_dir "$R" bd init --non-interactive --init-if-missing --skip-agents --skip-hooks \
     --prefix arun --server --external --server-host 127.0.0.1 --server-port "$PORT" \
-    --server-user root --database "t_contract_$$_${RANDOM}"
+    --server-user root --database "t_contract_$$_${RANDOM}" && [[ -f "$R/.beads/metadata.json" ]] || {
+    echo "### INIT FAILED in $R"; return 1; }
   step info db B info
   E=$(B create --silent --type epic --priority 1 --title "agentic-run o/r#7" \
     --labels "agentic-run,agentic-run:run,agentic-run:state:starting" \
@@ -201,8 +205,15 @@ calls() { # <root>
   step "list past 50 rows, captured" count B list --json --label bulk --all
 }
 
-( calls "$T/fake" ) > "$T/fake.raw"
-( PATH="$T/realbin:$PATH"; calls "$T/real" ) > "$T/real.raw"
+# BEADS_DIR or BEADS_DB in the caller's env would point the real bd at a store of
+# the caller's instead of the throwaway one.
+( unset BEADS_DIR BEADS_DB; calls "$T/fake" ) > "$T/fake.raw"; FRC=$?
+( unset BEADS_DIR BEADS_DB; PATH="$T/realbin:$PATH"; calls "$T/real" ) > "$T/real.raw"; RRC=$?
+if (( FRC != 0 || RRC != 0 )); then
+  fail "bd init failed (fake rc=$FRC, real rc=$RRC); the contract stopped before any other call" \
+    "$(grep -h -A3 '^### init' "$T/fake.raw" "$T/real.raw")"
+  report; exit 1
+fi
 
 cat > "$T/norm.py" <<'PY'
 import json, re, sys
@@ -254,6 +265,8 @@ echo "== the fake answers every call the way bd does"
 [[ -f "$T/fake/.bd-fake.json" && ! -e "$T/real/.bd-fake.json" && -d "$T/real/.beads/dolt" ]] &&
   grep -q '^### id E arun-' "$T/real.raw"
 check "each side ran on its own bd" $? "$(head -20 "$T/real.raw")"
+is "and the real side's store is on the throwaway server" "server 127.0.0.1 $PORT" \
+  "$(jq -r '"\(.dolt_mode) \(.dolt_server_host) \(.dolt_server_port)"' "$T/real/.beads/metadata.json" 2>&1)"
 is "the same steps on both sides" "$(grep -c '^### ' "$T/real.norm")" "$(grep -c '^### ' "$T/fake.norm")"
 D=$(diff -u "$T/real.norm" "$T/fake.norm"); RC=$?
 check "and the same answer to each (- real, + fake)" $RC "$(head -150 <<<"$D")"
@@ -273,7 +286,7 @@ for pass in "with both ports" "with the port file alone"; do
   if [[ "$pass" == *alone ]]; then
     jq 'del(.dolt_server_port)' "$FR/.beads/metadata.json" > "$T/m.json" && mv "$T/m.json" "$FR/.beads/metadata.json"
   fi
-  OUT=$(cd "$T" && env -u BEADS_DOLT_AUTO_START BD_DISABLE_METRICS=1 "$REAL" -C "$FR" list --json 2>&1); RC=$?
+  OUT=$(cd "$T" && env -u BEADS_DOLT_AUTO_START -u BEADS_DIR -u BEADS_DB BD_DISABLE_METRICS=1 "$REAL" -C "$FR" list --json 2>&1); RC=$?
   [[ "$RC" -ne 0 ]]; check "$pass: bd exits non-zero" $? "rc=$RC $OUT"
   ! jq -e 'type == "array"' <<<"$OUT" >/dev/null 2>&1; check "$pass: and lists nothing" $? "$OUT"
   [[ ! -e "$FR/.beads/dolt-server.pid" && ! -e "$FR/.beads/dolt" ]]
