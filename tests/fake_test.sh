@@ -43,6 +43,14 @@ mkdir -p "$HOME/.bd-fake-never-$$" 2>/dev/null && {
   grep -q 'outside BD_FAKE_ALLOWED_ROOTS' "$T/guard2.log"; check "naming the setting" $? "$(cat "$T/guard2.log" 2>/dev/null)"
   rmdir "$HOME/.bd-fake-never-$$"; }
 
+echo "== version flags work anywhere"
+# A requirements check runs them from wherever it is, outside every temp dir.
+OUT=$(cd / && bd --version 2>&1); is "--version outside the fence exits 0" "0" "$?"
+is "and names bd's version" "bd version 1.3.0 (bd-fake)" "$OUT"
+OUT=$(cd / && bd version 2>&1); is "so does the version verb" "0 bd version 1.3.0 (bd-fake)" "$? $OUT"
+OUT=$(cd / && bd --bd-fake-version 2>&1); is "--bd-fake-version exits 0" "0" "$?"
+is "and prints the package's own version" "bd-fake $(jq -r .version "$_TESTLIB_DIR/../package.json")" "$OUT"
+
 echo "== BD_FAKE_ALLOWED_ROOTS"
 mkdir -p "$T/allowed/r" "$T/other/r"
 BD_FAKE_ALLOWED_ROOTS="$T/allowed" fake_root "$T/allowed/r"

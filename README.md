@@ -56,7 +56,7 @@ Every call may carry `-C <dir>` / `--directory`. `--db` and `--global` are refus
 |---|---|
 | `init` | `--non-interactive --init-if-missing --skip-agents --skip-hooks --server --external --quiet --prefix --server-host --server-port --server-user --database` |
 | `info` | `--json` |
-| `version`, `--version` | |
+| `version`, `--version` | Answers from any directory, fenced or not. `--bd-fake-version` prints bd-fake's own version (`bd-fake 0.1.0`). |
 | `create` | `--silent --json --no-inherit-labels --type --priority --title --description --parent --status --labels --metadata --deps` |
 | `show <id>...` | `--json` (required) |
 | `list` | `--json` (required) `--all --label --metadata-field --parent --limit` (no 50-row default unless stdout is a terminal, as bd) |

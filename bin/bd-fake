@@ -30,6 +30,7 @@ import re
 import time
 
 VERSION = "1.3.0 (bd-fake)"
+PACKAGE_VERSION = "0.1.0"  # package.json's; fake_test.sh holds them equal
 ACTOR = "bd-fake"
 OWNER = "bd-fake@example.invalid"
 STORE = ".bd-fake.json"
@@ -1139,6 +1140,8 @@ def check_schema():
 
 def main():
     d, rest = split_global(ARGV)
+    if rest[:1] == ["version"]:
+        return v_version(None, {}, [])  # reads no store, so it needs no root
     root = guarded_root(d)
     if not rest or rest[0] in ("help", "-h", "--help"):
         unsupported("help")
@@ -1157,6 +1160,9 @@ def run():
     global ERROR
     if ARGV[:1] == ["--check-schema"]:
         return check_schema()
+    if ARGV[:1] == ["--bd-fake-version"]:
+        print("bd-fake %s" % PACKAGE_VERSION)
+        return 0
     try:
         main()
         sys.stdout.flush()
