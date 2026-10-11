@@ -47,12 +47,13 @@ mkdir -p "$T/realbin"; ln -s "$REAL" "$T/realbin/bd"
 # Every step prints `### <label> rc=<n>` and then what is compared: JSON as bd printed
 # it, or a line of facts drawn from text output. `### id <name> <value>` lines teach
 # the normalizer which id is which.
-step() { # <label> <kind: json|rc|first|count|db|has:<text>> <cmd...>; returns the command's rc
+step() { # <label> <kind: json|jq:<filter>|rc|first|count|db|has:<text>> <cmd...>; returns the command's rc
   local label="$1" kind="$2" out rc; shift 2
   out=$("$@" 2>/dev/null); rc=$?
   printf '### %s rc=%s\n' "$label" "$rc"
   case "$kind" in
     json)  printf '%s\n' "$out" ;;
+    jq:*)  jq -c "${kind#jq:}" <<<"$out" ;;
     rc)    ;;
     first) printf '%s\n' "$out" | head -1 ;;
     count) jq length <<<"$out" ;;
@@ -61,8 +62,15 @@ step() { # <label> <kind: json|rc|first|count|db|has:<text>> <cmd...>; returns t
   esac
   return "$rc"
 }
+idstep() { # <var> <label> <cmd...>: a json step whose output's .id is set in <var>, by name
+  local _out _rc _id
+  _out=$("${@:3}" 2>/dev/null); _rc=$?
+  _id=$(jq -r .id <<<"$_out" 2>/dev/null)
+  printf '### %s rc=%s\n%s\n### id %s %s\n' "$2" "$_rc" "$_out" "$1" "$_id"
+  printf -v "$1" '%s' "$_id"
+}
 calls() { # <root>
-  local R="$1" E T1 T2 T3 T4 T5 G H X
+  local R="$1" E T1 T2 T3 T4 T5 G H X J1 J2 J3 J4 J6 J7 G3
   B() { bd -C "$R" "$@"; }
   in_dir() { local d="$1"; shift; (cd "$d" && "$@"); }
   mkdir -p "$R"
@@ -200,6 +208,57 @@ calls() { # <root>
   step "show closed" json B show "$E" "$T4" --json
   step "update a missing id" rc B update arun-nope --set-metadata a=b
   step "comments on a missing id" json B comments arun-nope --json
+  step "info via --directory" db bd --directory "$R" info
+  step "info via --directory=" db bd --directory="$R" info
+  # Its values are the fake's own (no dolt path, no "direct" mode); its shape is bd's.
+  step "info --json" 'jq:{keys: keys, issue_count, schema_version, config, path: (.database_path | type), mode: (.mode | type)}' \
+    B info --json
+  idstep J1 "create --json" B create --json --type task --priority 1 --title "made with --json" \
+    --description "a description" --status in_progress --labels "x,y" --metadata '{"k":"v"}'
+  step "show what --json created" json B show "$J1" --json
+  idstep J2 "create --json --silent prints the JSON" B create --json --silent --title "both flags"
+  idstep J3 "create --json, born closed" B create --json --title "born closed" --status closed
+  idstep J4 "create --json, a child" B create --json --parent "$J1" --title kid --labels z
+  step "update --json to in_progress" json B update "$J2" --json --status in_progress
+  step "update --json back to open keeps started_at" json B update "$J2" --json --status open
+  step "update --json with nothing to update" first B update "$J2" --json
+  step "update --json several, one missing" json B update "$J2" arun-nope --json --set-metadata z=1
+  step "update --json with every id refused" json B update "$J1" --json --status closed
+  step "close --json --reason" json B close "$J4" --json --reason "done with it"
+  step "show the reason" json B show "$J4" --json
+  step "close --json a missing id" json B close "$J3" arun-nope --json
+  step "dep add --json" json B dep add "$J2" "$J1" --json
+  step "dep add --json again" json B dep add "$J2" "$J1" --json
+  step "close --json past a blocker" json B close "$J2" --json
+  step "dep add --json closing a cycle" json B dep add "$J1" "$J2" --json
+  step "dep add --json a missing first id" json B dep add arun-nope "$J1" --json
+  step "dep add --json a missing second id" json B dep add "$J1" arun-nope --json
+  step "dep remove --json" json B dep remove "$J2" "$J1" --json
+  step "dep remove --json, nothing there" json B dep remove "$J2" "$J1" --json
+  step "dep remove --json a missing id" json B dep remove "$J2" arun-nope --json
+  step "note --json" json B note "$J1" --json "a note"
+  step "note --json a missing id" json B note arun-nope --json "x"
+  step "comments add --json" json B comments add "$J1" --json "a comment"
+  step "comments add --json a missing id" json B comments add arun-nope --json "x"
+  idstep G3 "gate create --json" B gate create --type=gh:pr --blocks "$J1" --await-id 5 --reason "why" --json
+  step "gate create --json a missing id" json B gate create --type human --blocks arun-nope --json
+  step "gate resolve --json prints text" first B gate resolve "$G3" --json
+  # bd rewrites a deleted id in the descriptions and notes of the issues linked to it,
+  # and leaves titles, and every issue not linked to it, as they were.
+  idstep J6 "create one that names another" B create --json --title "names $J2" --description "names $J2"
+  idstep J7 "and one linked to it that names it" B create --json --title "waits on $J2" \
+    --description "waits on $J2" --deps "$J2"
+  step "delete without --force" rc B delete "$J6"
+  step "deletes nothing" json B show "$J6" --json
+  step "delete without --force, with a dependent" rc B delete "$J1"
+  step "delete --force --json" json B delete "$J2" --force --json
+  step "show the two that named it" json B show "$J6" "$J7" --json
+  step "delete --force --json a missing id" json B delete arun-nope --force --json
+  for p in 4 3 2 1 0; do
+    echo "### id L$p $(B create --silent --type task --priority "$p" --title "lim $p" --labels lim 2>/dev/null)"
+  done
+  step "list --limit 2" json B list --json --label lim --limit 2
+  step "ready --limit 2" json B ready --json --label lim --limit 2
   step "list everything" json B list --all --limit 0 --json
   for i in $(seq 1 55); do B create --silent --type task --priority 3 --title "bulk $i" --labels bulk >/dev/null 2>&1; done
   step "list past 50 rows, captured" count B list --json --label bulk --all
@@ -217,7 +276,8 @@ fi
 
 cat > "$T/norm.py" <<'PY'
 import json, re, sys
-VOLATILE = {"created_at", "updated_at", "closed_at", "owner", "created_by", "author", "actor", "revision"}
+VOLATILE = {"created_at", "updated_at", "closed_at", "started_at", "owner", "created_by", "author", "actor",
+            "revision"}
 # bd does not specify a list's order, so these
 # are compared as sets.
 SORTED = {"list phases", "list by metadata", "list leaves gates out", "list without --all",

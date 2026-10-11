@@ -282,6 +282,13 @@ class Store:
         self.deps.append({"issue_id": a, "depends_on_id": b, "type": typ, "created_at": now()})
 
 
+def resolve(st, ident):
+    """st.get, worded the way note and comments add word a miss."""
+    if ident not in st.issues:
+        raise Fail('resolving %s: no issue found matching "%s"' % (ident, ident))
+    return st.issues[ident]
+
+
 def now():
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
@@ -304,6 +311,12 @@ def out_json(obj):
     sys.stdout.write(dumps(obj) + "\n")
 
 
+def out_reply(obj):
+    """What bd prints for one record a mutating verb made or changed: a map, so its keys
+    are sorted, with schema_version in it."""
+    out_json(dict(sorted(dict(obj, schema_version=1).items())))
+
+
 def base(i):
     o = {"id": i["id"], "title": i["title"]}
     for k in ("description", "notes"):
@@ -311,7 +324,7 @@ def base(i):
             o[k] = i[k]
     o.update(status=i["status"], priority=i["priority"], issue_type=i["issue_type"], owner=OWNER,
              created_at=i["created_at"], created_by=ACTOR, updated_at=i["updated_at"])
-    for k in ("closed_at", "close_reason", "await_type", "await_id"):
+    for k in ("started_at", "closed_at", "close_reason", "await_type", "await_id"):
         if i.get(k):
             o[k] = i[k]
     if i.get("metadata"):
@@ -452,6 +465,10 @@ def set_status(st, i, status, force, reason=None):
         else:
             i.pop("close_reason", None)
     else:
+        # bd stamps started_at the first time an update moves an issue to in_progress
+        # (not a create born in_progress) and keeps it through every later status.
+        if status == "in_progress" and not i.get("started_at"):
+            i["started_at"] = now()
         i["status"] = status
         i.pop("closed_at", None)
         i.pop("close_reason", None)
@@ -513,7 +530,14 @@ def v_info(root, o, p):
     st = open_store(root, False)
     n = len(st.issues)
     if o.get("json"):
-        out_json({"database_path": st.path, "issue_count": n, "mode": "fake", "schema_version": 1})
+        # bd 1.3.0's defaults; the store and mode are the fake's own.
+        config = {"auto_compact_enabled": "false", "compact_batch_size": "50",
+                  "compact_parallel_workers": "5", "compact_tier1_days": "30",
+                  "compact_tier1_dep_levels": "2", "compact_tier2_commits": "100",
+                  "compact_tier2_days": "90", "compact_tier2_dep_levels": "5",
+                  "compaction_enabled": "false", "issue_prefix": st.d["prefix"]}
+        out_json({"config": config, "database_path": st.path, "issue_count": n, "mode": "fake",
+                  "schema_version": 1})
         return
     print("\nBeads Database Information\n===========================\nDatabase: %s\nMode: fake\n\nIssue Count: %d\n"
           % (st.path, n))
@@ -575,10 +599,10 @@ def v_create(root, o, p):
     if parent:
         st.add_dep(ident, parent, "parent-child")
     st.save()
-    if o.get("silent"):
+    if o.get("json"):
+        out_reply(base(i))
+    elif o.get("silent"):
         print(ident)
-    elif o.get("json"):
-        out_json(base(i))
     else:
         print("✓ Created issue: %s — %s\n  Priority: P%d\n  Status: %s" % (ident, title, i["priority"], status))
 
@@ -654,7 +678,7 @@ def v_update(root, o, p):
         print("No updates specified")
         return
     st = open_store(root, True)
-    failed = []
+    failed, done = [], []
     for ident in p:
         try:
             # On a copy: a refusal (a close bd will not make) must leave nothing half-applied.
@@ -674,17 +698,25 @@ def v_update(root, o, p):
                 set_status(st, i, o["status"], o.get("force"))
             touch(i)
             st.issues[ident] = i
-            print("✓ Updated issue: %s — %s" % (i["id"], i["title"]))
+            done.append(i)
+            if not o.get("json"):
+                print("✓ Updated issue: %s — %s" % (i["id"], i["title"]))
         except Fail as e:
             failed.append((ident, str(e)))
+    if done:
+        st.save()
+        if o.get("json"):
+            out_json([base(i) for i in done])
     if failed:
-        # bd applies an update per issue; with one id a refusal means nothing changed.
-        if len(failed) < len(p):
-            st.save()
         for ident, msg in failed:
             sys.stderr.write("Error updating %s: %s\n" % (ident, msg))
-        raise Fail("%d of %d issues failed to update" % (len(failed), len(p)))
-    st.save()
+        summary = "%d of %d issues failed to update" % (len(failed), len(p))
+        if not o.get("json"):
+            raise Fail(summary)
+        # With --json bd puts this on stderr, not stdout, where the updated rows went.
+        sys.stderr.write(json.dumps({"error": summary, "schema_version": 1,
+                                     "failed": [{"id": a, "error": m} for a, m in failed]}) + "\n")
+        sys.exit(1)
 
 
 def v_close(root, o, p):
@@ -694,7 +726,7 @@ def v_close(root, o, p):
     for ident in p:
         if ident not in st.issues:
             raise Fail('resolving ID %s: no issue found matching "%s"' % (ident, ident))
-    closed = 0
+    closed = []
     for ident in p:
         i = st.issues[ident]
         kids = [c for c in st.children(ident) if st.issues[c]["status"] != "closed"]
@@ -707,16 +739,24 @@ def v_close(root, o, p):
         if kids and o.get("force"):
             sys.stderr.write("warning: closing %s with %d open child issue(s) still active\n" % (ident, len(kids)))
         touch(i)
-        closed += 1
-        print("✓ Closed %s — %s: %s" % (ident, i["title"], i.get("close_reason", "Closed")))
+        closed.append(i)
+        if not o.get("json"):
+            print("✓ Closed %s — %s: %s" % (ident, i["title"], i.get("close_reason", "Closed")))
     if not closed:
         sys.exit(1)
     st.save()
+    if o.get("json"):
+        out_json([base(i) for i in closed])
 
 
 def v_delete(root, o, p):
     if not p:
         raise Fail("delete needs an issue id")
+    if o.get("json") and not o.get("force"):
+        # bd's preview counts the events it would drop, which the fake does not keep.
+        unsupported("delete --json without --force (bd's preview)")
+    if o.get("json") and len(p) > 1:
+        unsupported("delete --json with several ids (bd counts the events it dropped)")
     st = open_store(root, True)
     for ident in p:
         if ident not in st.issues:
@@ -729,20 +769,26 @@ def v_delete(root, o, p):
             raise Fail("issue has dependents not in deletion set; use --cascade to delete them or --force to orphan them")
         return
     for ident in p:
-        n = sum(1 for d in st.deps if ident in (d["issue_id"], d["depends_on_id"]))
-        st.deps[:] = [d for d in st.deps if ident not in (d["issue_id"], d["depends_on_id"])]
+        links = [d for d in st.deps if ident in (d["issue_id"], d["depends_on_id"])]
+        linked = {x for d in links for x in (d["issue_id"], d["depends_on_id"])} - {ident}
+        st.deps[:] = [d for d in st.deps if d not in links]
         st.d["comments"] = [c for c in st.d["comments"] if c["issue_id"] != ident]
         del st.issues[ident]
-        # bd rewrites mentions of a deleted id in the text of the issues left behind.
+        n = len(links)
+        # bd rewrites mentions of a deleted id in the description and notes of the issues
+        # linked to it; a title, and an unlinked issue, keep theirs.
         pat = re.compile(r"(?<![\w.-])" + re.escape(ident) + r"(?!\.?\w)")
         touched = 0
-        for other in st.issues.values():
+        for other in (st.issues[x] for x in sorted(linked) if x in st.issues):
             changed = False
-            for k in ("title", "description", "notes"):
+            for k in ("description", "notes"):
                 if other.get(k) and pat.search(other[k]):
                     other[k] = pat.sub("[deleted:%s]" % ident, other[k])
                     changed = True
             touched += changed
+        if o.get("json"):
+            out_reply({"deleted": ident, "dependencies_removed": n, "references_updated": touched})
+            continue
         print("✓ Deleted %s\n  Removed %d dependency link(s)" % (ident, n))
         if touched:
             print("  Updated text references in %d issue(s)" % touched)
@@ -753,10 +799,13 @@ def v_note(root, o, p):
     if len(p) < 2:
         raise Fail("note needs an issue id and text")
     st = open_store(root, True)
-    i = st.get(p[0])
+    i = resolve(st, p[0])
     append_notes(i, " ".join(p[1:]))
     touch(i)
     st.save()
+    if o.get("json"):
+        out_reply(base(i))
+        return
     print("✓ Note added to %s — %s" % (i["id"], i["title"]))
 
 
@@ -789,12 +838,15 @@ def v_comments_add(root, o, p):
     if len(p) != 2:
         raise Fail("comments add needs an issue id and the text")
     st = open_store(root, True)
-    i = st.get(p[0])
+    i = resolve(st, p[0])
     h = os.urandom(16).hex()
-    st.d["comments"].append({"id": "%s-%s-%s-%s-%s" % (h[:8], h[8:12], h[12:16], h[16:20], h[20:]),
-                             "issue_id": i["id"], "author": ACTOR, "text": p[1],
-                             "created_at": now()})
+    c = {"id": "%s-%s-%s-%s-%s" % (h[:8], h[8:12], h[12:16], h[16:20], h[20:]),
+         "issue_id": i["id"], "author": ACTOR, "text": p[1], "created_at": now()}
+    st.d["comments"].append(c)
     st.save()
+    if o.get("json"):
+        out_reply(c)
+        return
     print("Comment added to %s" % i["id"])
 
 
@@ -821,6 +873,9 @@ def v_gate_create(root, o, p):
                         "seq": st.next_seq(), "rev": 0}
     st.add_dep(blocks, ident, "blocks")
     st.save()
+    if o.get("json"):
+        out_reply(base(st.issues[ident]))
+        return
     print("✓ Created gate %s (type: %s)\n  Blocks: %s (%s)" % (ident, typ, blocks, b["title"]))
     if o.get("reason"):
         print("  Reason: %s" % o["reason"])
@@ -898,19 +953,28 @@ def v_dep(root, o, p, add):
     if len(p) != 2:
         raise Fail("dep needs two issue ids")
     st = open_store(root, True)
-    for ident in p:
-        if ident not in st.issues:
-            raise Fail('resolving issue ID %s: no issue found matching "%s"' % (ident, ident))
+    missing = 'resolving issue ID %s: no issue found matching "%s"'
+    if p[0] not in st.issues:
+        raise Fail(missing % (p[0], p[0]))
+    if p[1] not in st.issues:
+        raise Fail("resolving dependency ID %s: " % p[1] + missing % (p[1], p[1]))
     a, b = st.issues[p[0]], st.issues[p[1]]
+    reply = {"issue_id": a["id"], "depends_on_id": b["id"]}
     if add:
         typ = o.get("type", "blocks")
         check_dep_add(st, a["id"], b["id"], typ)
         st.add_dep(a["id"], b["id"], typ)
-        print("✓ Added dependency: %s (%s) depends on %s (%s) (%s)" % (a["id"], a["title"], b["id"], b["title"], typ))
+        reply.update(status="added", type=typ)
+        text = "✓ Added dependency: %s (%s) depends on %s (%s) (%s)" % (a["id"], a["title"], b["id"], b["title"], typ)
     else:
         st.deps[:] = [d for d in st.deps if not (d["issue_id"] == a["id"] and d["depends_on_id"] == b["id"])]
-        print("✓ Removed dependency: %s (%s) → %s (%s)" % (a["id"], a["title"], b["id"], b["title"]))
+        reply.update(status="removed")
+        text = "✓ Removed dependency: %s (%s) → %s (%s)" % (a["id"], a["title"], b["id"], b["title"])
     st.save()
+    if o.get("json"):
+        out_reply(reply)
+    else:
+        print(text)
 
 
 def descendants(st, ident):
@@ -938,7 +1002,9 @@ def v_ready(root, o, p):
             and want <= set(i.get("labels", []))
             and not any(st.open_blockers(x) for x in [i["id"]] + ancestors(st, i["id"]))]
     rows.sort(key=lambda i: (i["priority"], i["seq"]))
-    if limit > 0:
+    if 0 < limit < len(rows):
+        sys.stderr.write("Showing %d of %d ready issues. Use --limit 0 for all, or --limit N to raise the cap.\n"
+                         % (limit, len(rows)))
         rows = rows[:limit]
     out_json([list_row(st, i) for i in rows])
 
@@ -1142,6 +1208,11 @@ def check_schema():
     return 0
 
 
+# Verbs whose refusals bd prints, under --json, as a JSON error on stdout.
+JSON_ERRORS = {"close", "note", "comments add", "dep add", "dep remove", "gate create"}
+CALL = {}
+
+
 def main():
     d, rest = split_global(ARGV)
     if rest[:1] == ["version"]:
@@ -1157,6 +1228,7 @@ def main():
     if verb not in VERBS:
         unsupported("verb '%s'" % verb)
     opts, pos = parse(verb, args)
+    CALL.update(verb=verb, json=bool(opts.get("json")))
     VERBS[verb](root, opts, pos)
 
 
@@ -1178,7 +1250,10 @@ def run():
         log_refusal(msg)
         return 64
     except Fail as e:
-        sys.stderr.write("Error: %s\n" % e)
+        if CALL.get("json") and CALL.get("verb") in JSON_ERRORS:
+            out_json({"error": str(e), "schema_version": 1})
+        else:
+            sys.stderr.write("Error: %s\n" % e)
         return 1
     except BrokenPipeError:
         return 141

@@ -4,7 +4,7 @@ A drop-in fake [`bd`](https://github.com/gastownhall/beads) (Beads) for test sui
 
 It implements only the verbs and flags below, with the `--json` shapes bd 1.3.0 prints. Anything else exits **64** with the argv on stderr, so a new use fails loudly instead of faking a pass. A contract test keeps it honest against a real bd (see [Drift protection](#drift-protection)).
 
-Requires `python3` (3.7+) at runtime. Stdlib only. macOS and Linux.
+Requires `python3` (3.7+) at runtime. Stdlib only. macOS 12+ or Linux with coreutils 8.30+: the `#!/usr/bin/env -S python3 -I -S` shebang needs an `env` that takes `-S`. With no `python3` on PATH every call exits **127** (env's "command not found").
 
 ## Install
 
@@ -50,31 +50,39 @@ Composer's `vendor/bin/bd-fake` is a shell proxy, so symlink `vendor/jtsternberg
 
 ## What it implements
 
-Every call may carry `-C <dir>` / `--directory`. `--db` and `--global` are refused (97): both name a store around the root the fence checks.
+Every flag below is accepted. **Contracted** means `tests/contract_test.sh` makes that call against a real bd 1.3.0 and requires the same exit code and, for JSON, the same output once ids and timestamps are normalized. Text output is compared only where the table says so; elsewhere it is close to bd's but not checked.
 
-| Verb | Flags |
-|---|---|
-| `init` | `--non-interactive --init-if-missing --skip-agents --skip-hooks --server --external --quiet --prefix --server-host --server-port --server-user --database` |
-| `info` | `--json` |
-| `version`, `--version` | Answers from any directory, fenced or not. `--bd-fake-version` prints bd-fake's own version (`bd-fake 0.1.0`). |
-| `create` | `--silent --json --no-inherit-labels --type --priority --title --description --parent --status --labels --metadata --deps` |
-| `show <id>...` | `--json` (required) |
-| `list` | `--json` (required) `--all --label --metadata-field --parent --limit` (no 50-row default unless stdout is a terminal, as bd) |
-| `update <id>...` | `--json --force --set-metadata --unset-metadata --append-notes --status --add-label --remove-label --set-labels` |
-| `close <id>...` | `--json --force --reason` |
-| `delete <id>...` | `--json --force` |
-| `note <id> <text>` | `--json` |
-| `comments <id>`, `comments add <id> <text>` | `--json` |
-| `gate create`, `gate resolve <id>`, `gate list` | `--json --type --blocks --await-id --reason` |
-| `dep add <a> <b>`, `dep remove <a> <b>` | `--json`, `--type` on add |
-| `ready` | `--json` (required) `--parent --label --limit` |
-| `audit record` | `--kind --issue-id --response --tool-name` |
+Every call may carry `-C <dir>`, `--directory <dir>` or `--directory=<dir>` (all contracted). `--db` and `--global` are refused (97): both name a store around the root the fence checks.
+
+| Verb | Contracted | Accepted, not contracted |
+|---|---|---|
+| `init` | `--non-interactive --init-if-missing --skip-agents --skip-hooks --prefix --server --external --server-host --server-port --server-user --database` (exit code; the server flags are accepted and ignored) | `--quiet` |
+| `info` | text: has a `Database:` line. `--json`: its keys, `issue_count`, `schema_version` and `config`; `database_path` and `mode` are strings, but the fake's own (its JSON file, `"fake"`) | |
+| `version`, `--version` | | Answers from any directory, fenced or not. `--bd-fake-version` prints bd-fake's own version (`bd-fake 0.1.0`). |
+| `create` | `--silent --json --no-inherit-labels --type --priority --title --description --parent --status --labels --metadata --deps`; `--json` wins over `--silent` | `--metadata @file`, `--deps blocks:<id>` (exit 64) |
+| `show <id>...` | `--json`, found, missing, and both | text (exit 64) |
+| `list` | `--json --all --label --metadata-field --parent`, `--limit 0` and `--limit N`; no 50-row default when stdout is not a terminal | the 50-row default on a terminal; text (exit 64) |
+| `update <id>...` | `--json --force --set-metadata --unset-metadata --append-notes --status --add-label --remove-label --set-labels`, several ids with some refused; `started_at` stamped on the first move to `in_progress` | |
+| `close <id>...` | `--json --force --reason`, several ids with some refused or missing | |
+| `delete <id>...` | without `--force` (exit code, and that nothing is deleted; the preview text is not compared); `--force`; `--force --json` with one id | `--json` without `--force`, `--json` with several ids (exit 64: bd counts the events it drops, which the fake does not keep) |
+| `note <id> <text>` | `--json` | |
+| `comments <id>` | `--json`; text: says `No comments`, or carries the comment | |
+| `comments add <id> <text>` | `--json` | |
+| `gate create` | `--type --blocks --await-id --reason --json`; text: the first line | |
+| `gate resolve <id>` | `--reason`, `--json` (bd prints text for it, and so does the fake) | |
+| `gate list` | `--json` | text (exit 64) |
+| `dep add <a> <b>` | `--json --type`, and bd's refusals (missing id, self, cycle, parent, child, a link of another type) | |
+| `dep remove <a> <b>` | `--json`, nothing to remove, missing id | |
+| `ready` | `--json --parent --label`, `--limit N` | text (exit 64) |
+| `audit record` | `--kind --issue-id --response --tool-name`, with and without `BD_AUDIT_ENABLED` | |
+
+Under `--json`, `close`, `note`, `comments add`, `dep add`, `dep remove` and `gate create` print a refusal as `{"error": ..., "schema_version": 1}` on stdout, as bd does; `update --json` puts its error object on stderr. Both are contracted.
 
 The store is `<root>/.bd-fake.json`, locked with `flock` on `<root>/.bd-fake.lock`, so parallel writers do not lose each other's writes. `init` also writes `.beads/metadata.json` and `.beads/dolt-server.port` naming port 1, and `dolt.auto-start: false` in `.beads/config.yaml`: a real bd that ends up pointed at a fake root gets "connection refused" instead of falling back to the caller's database (gastownhall/beads#5756) or starting a server.
 
 ## Drift protection
 
-- **Contract test** (`tests/contract_test.sh`): one fixed script of calls, every verb and flag above, played against bd-fake and a real bd on a throwaway dolt server. Exit codes and JSON, with ids and timestamps normalized, must match.
+- **Contract test** (`tests/contract_test.sh`): one fixed script of calls, the **Contracted** column above, played against bd-fake and a real bd on a throwaway dolt server. Exit codes and JSON, with ids and timestamps normalized, must match.
 - **Version pin** (`tests/contract/BD_VERSION`): the bd the contract last passed against. Any other installed version fails the contract loudly, even when every step matches. After re-probing and fixing the fake, `BD_FAKE_ACCEPT_VERSION=1 bash tests/contract_test.sh` rewrites the pin, and only on a run where everything else is green.
 - **Schema check** (`bd-fake --check-schema`): validates the fake's show, list, ready, gate and comment records against a real bd's `bd schema`. A keyword it does not implement, a `format` other than `date-time`, or tuple-form `items` fails the check instead of passing unchecked. With no real bd on PATH it prints a skip and exits 0.
 

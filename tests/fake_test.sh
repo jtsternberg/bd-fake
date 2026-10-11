@@ -264,6 +264,23 @@ B delete "$P0" --force >/dev/null; is "delete --force exits 0" "0" "$?"
 B show "$P0" --json >/dev/null 2>&1; is "and the issue is gone" "1" "$?"
 is "with its links" "" "$(B show "$P3" --json | jq -r --arg z "$P0" '.[0].dependencies[] | select(.id==$z) | .id')"
 
+echo "== --json on the verbs that write"
+J=$(B create --json --silent --title "both")
+is "create --json wins over --silent, as in bd" "both 1" "$(jq -r '"\(.title) \(.schema_version)"' <<<"$J")"
+JI=$(jq -r .id <<<"$J")
+is "update --json is an array of what it changed" "$JI in_progress true" \
+  "$(B update "$JI" --json --status in_progress | jq -r '.[0] | "\(.id) \(.status) \(has("started_at"))"')"
+is "started_at survives a move back to open" "true" "$(B update "$JI" --json --status open | jq '.[0] | has("started_at")')"
+is "dep add --json says what it added" "added blocks" \
+  "$(B dep add "$JI" "$T1" --json | jq -r '"\(.status) \(.type)"')"
+is "a refusal under --json is a JSON error on stdout" "1 resolving arun-nope: no issue found matching \"arun-nope\"" \
+  "$(OUT=$(B note arun-nope --json x 2>/dev/null); echo "$? $(jq -r .error <<<"$OUT")")"
+BD_FAKE_REFUSAL_LOG="$T/dj.log" B delete "$JI" --json >/dev/null 2>&1
+is "delete --json without --force (bd's preview) is unsupported" "64" "$?"
+BD_FAKE_REFUSAL_LOG="$T/dj.log" B delete "$JI" "$T1" --force --json >/dev/null 2>&1
+is "and so is delete --json with several ids" "64" "$?"
+is "delete --force --json with one id" "$JI 1" "$(B delete "$JI" --force --json | jq -r '"\(.deleted) \(.dependencies_removed)"')"
+
 echo "== gate and audit"
 G=$(B gate create --type=gh:pr --blocks "$P3" --await-id 7 | sed -n 's/^✓ Created gate \([^ ]*\) .*/\1/p')
 [[ "$G" =~ ^arun-[0-9a-z]+$ ]]; check "gate create names a top-level gate" $? "$G"
