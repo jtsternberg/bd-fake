@@ -312,7 +312,7 @@ echo "== a required contract cannot be skipped"
 # CI sets BD_FAKE_REQUIRE_CONTRACT=1, so a broken bd or dolt install fails the run
 # instead of passing it on the fake's own tests alone.
 mkdir -p "$T/nobd-bin"; ln -s "$(command -v python3)" "$(command -v jq)" "$T/nobd-bin/"
-OUT=$(env PATH="$T/nobd-bin:/usr/bin:/bin" bash "$_TESTLIB_DIR/contract_test.sh" 2>&1)
+OUT=$(env -u BD_FAKE_REQUIRE_CONTRACT PATH="$T/nobd-bin:/usr/bin:/bin" bash "$_TESTLIB_DIR/contract_test.sh" 2>&1)
 is "with no bd and no dolt the contract skips, exit 0" "0" "$?"
 OUT=$(env PATH="$T/nobd-bin:/usr/bin:/bin" BD_FAKE_REQUIRE_CONTRACT=1 bash "$_TESTLIB_DIR/contract_test.sh" 2>&1)
 is "with BD_FAKE_REQUIRE_CONTRACT=1 it is exit 1" "1" "$?"
