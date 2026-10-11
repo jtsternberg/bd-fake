@@ -6,7 +6,8 @@
 #
 # THE ONE SLOW TEST, and slow on purpose: it runs the real binary (a dolt server, and a
 # Go binary opening a database on every call). Skipped, with the reason, when dolt or a
-# real bd is not installed.
+# real bd is not installed; with BD_FAKE_REQUIRE_CONTRACT=1 (as CI sets it) that skip
+# fails the file instead.
 #
 # tests/contract/BD_VERSION is the bd version this contract last passed against. An
 # installed bd of any other version fails the file, loudly, even when every step
@@ -28,7 +29,9 @@ for d in "${_PATHS[@]}"; do
   REAL="$d/bd"; break
 done
 if [[ -z "$REAL" ]] || ! command -v dolt >/dev/null 2>&1; then
-  echo "  (skipped: the contract needs a real bd and dolt; found bd='${REAL:-none}' dolt='$(command -v dolt || echo none)')"
+  why="the contract needs a real bd and dolt; found bd='${REAL:-none}' dolt='$(command -v dolt || echo none)'"
+  if [[ "${BD_FAKE_REQUIRE_CONTRACT:-}" == 1 ]]; then fail "BD_FAKE_REQUIRE_CONTRACT=1, and $why"
+  else echo "  (skipped: $why)"; fi
   report; exit 0
 fi
 PIN_FILE="$_TESTLIB_DIR/contract/BD_VERSION"

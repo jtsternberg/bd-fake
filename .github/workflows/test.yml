@@ -13,30 +13,44 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
-      # The contract test needs a real bd and dolt. bd is the version
+      # The contract test needs a real bd and dolt: bd at the version
       # tests/contract/BD_VERSION pins (any other one fails the contract on purpose),
-      # from its release tarball rather than brew, whose formula tracks the newest.
+      # dolt at tests/contract/DOLT_VERSION, both from their release tarballs rather
+      # than brew, whose formulas track the newest. Each tarball is checked against a
+      # sha256 before it is unpacked: bd's from the release's checksums.txt, dolt's
+      # pinned below, since dolt publishes none.
       - name: Install the pinned bd and dolt
         timeout-minutes: 3
-        continue-on-error: true
         shell: bash
         run: |
           set -euo pipefail
           BD_VERSION=$(tr -d '[:space:]' < tests/contract/BD_VERSION)
-          DOLT_VERSION=2.3.5
+          DOLT_VERSION=$(tr -d '[:space:]' < tests/contract/DOLT_VERSION)
           case "$(uname -s)-$(uname -m)" in
             Linux-x86_64) os=linux arch=amd64 ;;
             Darwin-arm64) os=darwin arch=arm64 ;;
             Darwin-x86_64) os=darwin arch=amd64 ;;
             *) echo "no release for $(uname -s)-$(uname -m)"; exit 1 ;;
           esac
-          mkdir -p "$RUNNER_TEMP/tools"
+          # Keyed by version too, so a DOLT_VERSION bump without new sums fails here.
+          case "$DOLT_VERSION-$os-$arch" in
+            2.3.5-linux-amd64)  dolt_sha=c49d4c3e004cf1581ba0d4a00c5023a26f84eb2ec15d5fe876eed36d5343f463 ;;
+            2.3.5-darwin-arm64) dolt_sha=ad1e3770accbb7e8a059069228ead22bdf6f2759131212451b44f518661b8e40 ;;
+            2.3.5-darwin-amd64) dolt_sha=ffcfcdde00c14bd43c4ad7c71b6210fbfb33717bb23712398cb2d36cf6dca61f ;;
+            *) echo "no pinned sha256 for dolt $DOLT_VERSION on $os-$arch"; exit 1 ;;
+          esac
+          dl="$RUNNER_TEMP/dl"; mkdir -p "$dl" "$RUNNER_TEMP/unpack" "$RUNNER_TEMP/tools"
+          bd_tgz="beads_${BD_VERSION}_${os}_${arch}.tar.gz"
+          base="https://github.com/gastownhall/beads/releases/download/v${BD_VERSION}"
+          curl -fsSL -o "$dl/$bd_tgz" "$base/$bd_tgz"
+          curl -fsSL -o "$dl/checksums.txt" "$base/checksums.txt"
+          (cd "$dl" && grep -E "^[0-9a-f]{64}  ${bd_tgz}\$" checksums.txt | shasum -a 256 -c -)
+          curl -fsSL -o "$dl/dolt.tar.gz" \
+            "https://github.com/dolthub/dolt/releases/download/v${DOLT_VERSION}/dolt-${os}-${arch}.tar.gz"
+          (cd "$dl" && echo "$dolt_sha  dolt.tar.gz" | shasum -a 256 -c -)
           # Unpacked whole, then found by name: the tarballs' layouts differ per OS.
-          mkdir -p "$RUNNER_TEMP/unpack"
-          curl -fsSL "https://github.com/gastownhall/beads/releases/download/v${BD_VERSION}/beads_${BD_VERSION}_${os}_${arch}.tar.gz" \
-            | tar xz -C "$RUNNER_TEMP/unpack"
-          curl -fsSL "https://github.com/dolthub/dolt/releases/download/v${DOLT_VERSION}/dolt-${os}-${arch}.tar.gz" \
-            | tar xz -C "$RUNNER_TEMP/unpack"
+          tar xzf "$dl/$bd_tgz" -C "$RUNNER_TEMP/unpack"
+          tar xzf "$dl/dolt.tar.gz" -C "$RUNNER_TEMP/unpack"
           for b in bd dolt; do
             f=$(find "$RUNNER_TEMP/unpack" -type f -name "$b" | head -1)
             [[ -n "$f" ]] || { echo "no $b in the release tarball"; exit 1; }
@@ -44,10 +58,12 @@ jobs:
           done
           git config --global user.name "bd-fake CI"
           git config --global user.email "ci@example.invalid"
-          dolt config --global --add user.name "bd-fake CI" || true
-          dolt config --global --add user.email "ci@example.invalid" || true
+          "$RUNNER_TEMP/tools/dolt" config --global --add user.name "bd-fake CI"
+          "$RUNNER_TEMP/tools/dolt" config --global --add user.email "ci@example.invalid"
           echo "$RUNNER_TEMP/tools" >> "$GITHUB_PATH"
           "$RUNNER_TEMP/tools/bd" --version
           "$RUNNER_TEMP/tools/dolt" version
       - name: Test
+        env:
+          BD_FAKE_REQUIRE_CONTRACT: "1"
         run: bash tests/run.sh

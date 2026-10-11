@@ -92,7 +92,7 @@ The store is `<root>/.bd-fake.json`, locked with `flock` on `<root>/.bd-fake.loc
 bash tests/run.sh
 ```
 
-Runs `fake_test.sh` and `schema_test.sh` always, and `contract_test.sh` (about a minute) when a real `bd` and `dolt` are on PATH; it says so when it skips. CI installs the pinned bd and dolt from their release tarballs on Ubuntu and macOS.
+Runs `fake_test.sh` and `schema_test.sh` always, and `contract_test.sh` (about a minute) when a real `bd` and `dolt` are on PATH; it says so when it skips. `BD_FAKE_REQUIRE_CONTRACT=1` turns that skip into a failure. CI sets it, and installs bd at `tests/contract/BD_VERSION` and dolt at `tests/contract/DOLT_VERSION` from their release tarballs on Ubuntu and macOS, each checked against a sha256 first (bd's from the release's `checksums.txt`, dolt's pinned in the workflow).
 
 ## License
 

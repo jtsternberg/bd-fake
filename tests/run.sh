@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
-# run.sh — every bd-fake test file, one summary line each, then the total. The
-# contract test runs only when a real bd and dolt are on PATH, last, and says so when
-# it does not. A file that prints no "N passed, M failed" line is a failure.
+# run.sh [--list] — every bd-fake test file, one summary line each, then the total. The
+# contract test runs last, and only when a real bd and dolt are on PATH or
+# BD_FAKE_REQUIRE_CONTRACT=1, in which case its own skip is a failure; it says so when
+# it does not run. A file that prints no "N passed, M failed" line is a failure.
+# --list prints the files it would run and runs none.
 set -uo pipefail
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 FILES=("$DIR/fake_test.sh" "$DIR/schema_test.sh")
@@ -11,8 +13,10 @@ real_bd() { # the first bd on PATH that is not bd-fake
     [[ -n "$d" && -x "$d/bd" && ! "$d/bd" -ef "$DIR/../bin/bd-fake" ]] && { echo "$d/bd"; return 0; }
   done; return 1
 }
-if real_bd >/dev/null && command -v dolt >/dev/null 2>&1; then FILES+=("$DIR/contract_test.sh")
+if [[ "${BD_FAKE_REQUIRE_CONTRACT:-}" == 1 ]] || { real_bd >/dev/null && command -v dolt >/dev/null 2>&1; }; then
+  FILES+=("$DIR/contract_test.sh")
 else echo "contract_test.sh: SKIPPED — needs a real bd and dolt on PATH (bd: $(real_bd || echo none), dolt: $(command -v dolt || echo none))"; fi
+if [[ "${1:-}" == --list ]]; then printf '%s\n' "${FILES[@]##*/}"; exit 0; fi
 LOGDIR=$(mktemp -d "${TMPDIR:-/tmp}/bd-fake-tests-XXXXXX") || exit 2
 P=0; F=0; BAD=0
 for f in "${FILES[@]}"; do

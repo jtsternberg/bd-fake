@@ -308,6 +308,18 @@ ID=$(BD_AUDIT_ENABLED=1 B audit record --kind tier --issue-id "$E2" --response s
 is "and appends one line to .beads/interactions.jsonl" "tier $E2 small agentic-run $ID" \
   "$(jq -r '"\(.kind) \(.issue_id) \(.response) \(.tool_name) \(.id)"' "$R/.beads/interactions.jsonl")"
 
+echo "== a required contract cannot be skipped"
+# CI sets BD_FAKE_REQUIRE_CONTRACT=1, so a broken bd or dolt install fails the run
+# instead of passing it on the fake's own tests alone.
+mkdir -p "$T/nobd-bin"; ln -s "$(command -v python3)" "$(command -v jq)" "$T/nobd-bin/"
+OUT=$(env PATH="$T/nobd-bin:/usr/bin:/bin" bash "$_TESTLIB_DIR/contract_test.sh" 2>&1)
+is "with no bd and no dolt the contract skips, exit 0" "0" "$?"
+OUT=$(env PATH="$T/nobd-bin:/usr/bin:/bin" BD_FAKE_REQUIRE_CONTRACT=1 bash "$_TESTLIB_DIR/contract_test.sh" 2>&1)
+is "with BD_FAKE_REQUIRE_CONTRACT=1 it is exit 1" "1" "$?"
+has "saying why" "BD_FAKE_REQUIRE_CONTRACT" "$OUT"
+OUT=$(env PATH="$T/nobd-bin:/usr/bin:/bin" BD_FAKE_REQUIRE_CONTRACT=1 bash "$_TESTLIB_DIR/run.sh" --list 2>&1)
+has "and run.sh runs it rather than skipping it" "contract_test.sh" "$OUT"
+
 echo "== concurrent writers do not lose each other's writes"
 for i in 1 2 3 4 5 6 7 8; do B create --silent --type task --priority 2 --title "c$i" >/dev/null & done; wait
 is "eight parallel creates are eight issues" "8" "$(B list --json --limit 0 | jq '[.[] | select(.title|startswith("c"))] | length')"
