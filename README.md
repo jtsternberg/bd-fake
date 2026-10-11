@@ -10,8 +10,9 @@ Requires `python3` (3.7+) at runtime. Stdlib only. macOS 12+ or Linux with coreu
 
 ```sh
 npm install -g github:jtsternberg/bd-fake#v0.1.0   # or: npm install -D github:jtsternberg/bd-fake#v0.1.0
-composer require --dev jtsternberg/bd-fake        # once it is on Packagist; until then add the repo as a vcs repository
 ```
+
+Composer installs from the same tag once the repo is listed as a `vcs` repository in your `composer.json`; then `composer require --dev jtsternberg/bd-fake:v0.1.0`. The package is on neither the npm registry nor Packagist, by choice: GitHub is the only distribution until a consumer needs a registry.
 
 Pin a tag: a bare `github:jtsternberg/bd-fake` installs whatever `main` is. Either installer puts a `bd-fake` command in `node_modules/.bin/` or `vendor/bin/`.
 
