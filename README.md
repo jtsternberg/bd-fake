@@ -9,11 +9,11 @@ Requires `python3` (3.7+) at runtime. Stdlib only. macOS 12+ or Linux with coreu
 ## Install
 
 ```sh
-npm install -g github:jtsternberg/bd-fake        # or: npm install -D github:jtsternberg/bd-fake
+npm install -g github:jtsternberg/bd-fake#v0.1.0   # or: npm install -D github:jtsternberg/bd-fake#v0.1.0
 composer require --dev jtsternberg/bd-fake        # once it is on Packagist; until then add the repo as a vcs repository
 ```
 
-Either one installs a `bd-fake` command (`node_modules/.bin/bd-fake`, `vendor/bin/bd-fake`).
+Pin a tag: a bare `github:jtsternberg/bd-fake` installs whatever `main` is. Either installer puts a `bd-fake` command in `node_modules/.bin/` or `vendor/bin/`.
 
 ## Use it as `bd` in a harness
 
