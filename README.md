@@ -9,10 +9,10 @@ Requires `python3` (3.7+) at runtime. Stdlib only. macOS 12+ or Linux with coreu
 ## Install
 
 ```sh
-npm install -g github:jtsternberg/bd-fake#v0.1.0   # or: npm install -D github:jtsternberg/bd-fake#v0.1.0
+npm install -g github:jtsternberg/bd-fake#v0.1.1   # or: npm install -D github:jtsternberg/bd-fake#v0.1.1
 ```
 
-Composer installs from the same tag once the repo is listed as a `vcs` repository in your `composer.json`; then `composer require --dev jtsternberg/bd-fake:v0.1.0`. The package is on neither the npm registry nor Packagist, by choice: GitHub is the only distribution until a consumer needs a registry.
+Composer installs from the same tag once the repo is listed as a `vcs` repository in your `composer.json`; then `composer require --dev jtsternberg/bd-fake:v0.1.1`. The package is on neither the npm registry nor Packagist, by choice: GitHub is the only distribution until a consumer needs a registry.
 
 Pin a tag: a bare `github:jtsternberg/bd-fake` installs whatever `main` is. Either installer puts a `bd-fake` command in `node_modules/.bin/` or `vendor/bin/`.
 
@@ -59,7 +59,7 @@ Every call may carry `-C <dir>`, `--directory <dir>` or `--directory=<dir>` (all
 |---|---|---|
 | `init` | `--non-interactive --init-if-missing --skip-agents --skip-hooks --prefix --server --external --server-host --server-port --server-user --database` (exit code; the server flags are accepted and ignored) | `--quiet` |
 | `info` | text: has a `Database:` line. `--json`: its keys, `issue_count`, `schema_version` and `config`; `database_path` and `mode` are strings, but the fake's own (its JSON file, `"fake"`) | |
-| `version`, `--version` | | Answers from any directory, fenced or not. `--bd-fake-version` prints bd-fake's own version (`bd-fake 0.1.0`). |
+| `version`, `--version` | | Answers from any directory, fenced or not. `--bd-fake-version` prints bd-fake's own version (`bd-fake 0.1.1`). |
 | `create` | `--silent --json --no-inherit-labels --type --priority --title --description --parent --status --labels --metadata --deps`; `--json` wins over `--silent` | `--metadata @file`, `--deps blocks:<id>` (exit 64) |
 | `show <id>...` | `--json`, found, missing, and both | text (exit 64) |
 | `list` | `--json --all --label --metadata-field --parent`, `--limit 0` and `--limit N`; no 50-row default when stdout is not a terminal | the 50-row default on a terminal; text (exit 64) |
