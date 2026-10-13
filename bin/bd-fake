@@ -25,9 +25,14 @@ import os
 import sys
 
 import fcntl
-import json
-import re
 import time
+
+try:
+    if sys.version_info < (3, 13):  # before 3.13 json encodes indent= in Python, not C
+        raise ImportError
+    import _json
+except ImportError:
+    _json = None
 
 VERSION = "1.3.0 (bd-fake)"
 PACKAGE_VERSION = "0.1.0"  # package.json's; fake_test.sh holds them equal
@@ -37,6 +42,70 @@ STORE = ".bd-fake.json"
 LOCK = ".bd-fake.lock"
 STATUSES = ("open", "in_progress", "blocked", "deferred", "closed", "pinned", "hooked")
 B36 = "0123456789abcdefghijklmnopqrstuvwxyz"
+
+
+class _Decoding:
+    """The settings _json's scanner reads off a default json.JSONDecoder."""
+    strict = True
+    object_hook = object_pairs_hook = None
+    parse_float, parse_int = float, int
+    parse_constant = {"-Infinity": float("-inf"), "Infinity": float("inf"),
+                      "NaN": float("nan")}.__getitem__
+
+
+def _not_serializable(o):
+    raise TypeError("Object of type %s is not JSON serializable" % o.__class__.__name__)
+
+
+class _JSON:
+    """json's loads/dumps/load/dump, byte for byte, without importing json: json imports
+    re, and re (with enum, functools and collections) was a third of a call's CPU. These
+    call _json's C scanner and encoder the way json's own one-shot paths do. Anything
+    they fail on, json itself redoes, so a failure is json's own exception."""
+    WS = " \t\n\r"
+
+    def __init__(self):
+        self.scan = _json.make_scanner(_Decoding()) if _json else None
+
+    @staticmethod
+    def stdlib():
+        import json
+        return json
+
+    def loads(self, s):
+        if self.scan is not None and type(s) is str:
+            try:
+                obj, end = self.scan(s, len(s) - len(s.lstrip(self.WS)))
+            except Exception:
+                pass
+            else:
+                if not s[end:].strip(self.WS):
+                    return obj
+        return self.stdlib().loads(s)
+
+    def dumps(self, obj, indent=None, ensure_ascii=True, separators=None):
+        if _json is not None:
+            enc = _json.encode_basestring_ascii if ensure_ascii else _json.encode_basestring
+            if isinstance(obj, str):
+                return enc(obj)
+            item, key = separators or ((",", ": ") if indent is not None else (", ", ": "))
+            ind = " " * indent if isinstance(indent, int) else indent
+            try:
+                return "".join(_json.make_encoder({}, _not_serializable, enc, ind, key, item,
+                                                  False, False, True)(obj, 0))
+            except Exception:
+                pass
+        return self.stdlib().dumps(obj, indent=indent, ensure_ascii=ensure_ascii,
+                                   separators=separators)
+
+    def load(self, f):
+        return self.loads(f.read())
+
+    def dump(self, obj, f, **kw):
+        f.write(self.dumps(obj, **kw))
+
+
+json = _JSON()
 
 
 class Usage(Exception):
@@ -777,6 +846,7 @@ def v_delete(root, o, p):
         n = len(links)
         # bd rewrites mentions of a deleted id in the description and notes of the issues
         # linked to it; a title, and an unlinked issue, keep theirs.
+        import re
         pat = re.compile(r"(?<![\w.-])" + re.escape(ident) + r"(?!\.?\w)")
         touched = 0
         for other in (st.issues[x] for x in sorted(linked) if x in st.issues):
@@ -1051,12 +1121,13 @@ SHOW_EXTRA = {"parent", "dependent_count", "dependency_count", "comment_count",
 LIST_EXTRA = {"parent", "dependent_count", "dependency_count", "comment_count"}
 SCHEMA_KEYWORDS = {"$schema", "$id", "type", "enum", "format", "properties", "required",
                    "additionalProperties", "items"}
-DATE_TIME = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})$")
+DATE_TIME = r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})$"
 JSON_TYPES = {"string": (str,), "integer": (int,), "number": (int, float), "boolean": (bool,),
               "object": (dict,), "array": (list,), "null": (type(None),)}
 
 
 def validate(v, sch, path, errs, extra=()):
+    import re
     if sch is True:
         return
     if sch is False:
@@ -1071,7 +1142,7 @@ def validate(v, sch, path, errs, extra=()):
             return
     if "enum" in sch and v not in sch["enum"]:
         errs.append("%s: %s not in %s" % (path, json.dumps(v), json.dumps(sch["enum"])))
-    if sch.get("format") == "date-time" and isinstance(v, str) and not DATE_TIME.match(v):
+    if sch.get("format") == "date-time" and isinstance(v, str) and not re.match(DATE_TIME, v):
         errs.append("%s: %s is not a date-time" % (path, json.dumps(v)))
     if isinstance(v, dict):
         props = sch.get("properties", {})

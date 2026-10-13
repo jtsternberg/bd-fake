@@ -320,6 +320,47 @@ has "saying why" "BD_FAKE_REQUIRE_CONTRACT" "$OUT"
 OUT=$(env PATH="$T/nobd-bin:/usr/bin:/bin" BD_FAKE_REQUIRE_CONTRACT=1 bash "$_TESTLIB_DIR/run.sh" --list 2>&1)
 has "and run.sh runs it rather than skipping it" "contract_test.sh" "$OUT"
 
+echo "== its JSON is the json module's, byte for byte, without importing it"
+OUT=$(python3 -IS - "$BD_FAKE" <<'PY' 2>&1
+import json, runpy, sys
+ns = runpy.run_path(sys.argv[1], run_name="bd_fake")
+fast, bad = ns["json"], []
+nan, inf = float("nan"), float("inf")
+values = ["plain", "é<>& ", 3, -0.0, 1e300, nan, -inf, 10**30, True, None, [], {},
+          {"a": [1, 2.5, {"é": "\"\\\n\x00\ud800"}, [[]], {}], "ü": {"k": None}, "": "x"}]
+kwargs = [{}, {"ensure_ascii": False}, {"indent": 2, "ensure_ascii": False},
+          {"separators": (",", ":")}, {"ensure_ascii": False, "separators": (",", ":")}]
+for v in values:
+    for kw in kwargs:
+        if fast.dumps(v, **kw) != json.dumps(v, **kw):
+            bad.append("dumps %r %r" % (v, kw))
+def outcome(f, s):
+    try:
+        return repr(f(s))
+    except Exception as e:
+        return "%s: %s" % (type(e).__name__, e)
+texts = [json.dumps(v, **kw) for v in values for kw in kwargs] + [
+    " {} \n", "[1,", "{} x", "﻿{}", "", "  ", "NaN", "1e400", "-", '"\\ud800"', '"a\nb"',
+    '{"a":1,"a":2}', "[" * 100000]
+for s in texts:
+    if outcome(fast.loads, s) != outcome(json.loads, s):
+        bad.append("loads %r: %s vs %s" % (s[:40], outcome(fast.loads, s)[:80], outcome(json.loads, s)[:80]))
+print("\n".join(bad) or "same")
+PY
+)
+is "dumps and loads match json's, errors included" "same" "$OUT"
+# json imports re, and re (with enum, functools and collections) was a third of a call's
+# CPU. From 3.13, json's C encoder takes indent=, so every call can skip both.
+if python3 -c 'import sys; sys.exit(sys.version_info < (3, 13))'; then
+  ID=$(B create --silent --type task --priority 2 --title "imports") || ID=
+  for args in "info" "list --json" "show $ID --json" "update $ID --status in_progress --json" \
+              "comments add $ID hi --json" "gate list --json"; do
+    # shellcheck disable=SC2086 # args is split on purpose
+    OUT=$(python3 -X importtime -IS "$BD_FAKE" -C "$R" $args 2>&1 >/dev/null | grep -E '\| +(re|json)$')
+    is "bd $args imports neither json nor re" "" "$OUT"
+  done
+else echo "  - python3 is before 3.13: json's own module is the path, so imports go unchecked"; fi
+
 echo "== concurrent writers do not lose each other's writes"
 for i in 1 2 3 4 5 6 7 8; do B create --silent --type task --priority 2 --title "c$i" >/dev/null & done; wait
 is "eight parallel creates are eight issues" "8" "$(B list --json --limit 0 | jq '[.[] | select(.title|startswith("c"))] | length')"
